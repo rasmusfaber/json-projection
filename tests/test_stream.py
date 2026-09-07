@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import gc
+import sys
 from collections.abc import Iterable
 
 import pytest
 
-from json_projection import Projection
+from json_projection import Projection, ProjectionStream
 from reference import canon, corpus, parse, reference_project
 
 
@@ -21,6 +22,20 @@ def test_stream_public_api():
     session.feed(b'{"id":1,"discard":[')
     session.feed(b"1,2,3]}")
     assert session.finish() == b'{"id":1}'
+
+
+def test_sessions_are_created_by_the_projection():
+    with pytest.raises(TypeError):
+        ProjectionStream()
+
+
+def test_input_chunk_is_not_retained_after_feed():
+    chunk = b'{"drop":"' + b"x" * 100_000 + b'"}'
+    references = sys.getrefcount(chunk)
+    session = Projection(set()).stream()
+    session.feed(chunk)
+    assert sys.getrefcount(chunk) == references
+    assert session.finish() == b"{}"
 
 
 def test_interleaved_sessions_own_their_plan():
@@ -166,6 +181,23 @@ def test_invalid_raw_utf8_is_preserved_or_discarded():
     assert run_chunks(Projection(set()), (raw,)) == b"{}"
     assert run_chunks(Projection({"id"}), (raw,)) == b'{"id":"\xff"}'
     assert run_chunks(Projection({"drop"}), (raw,)) == b'{"drop":{"\xff":"\xfe"}}'
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"\xff":1}',
+        b'{"\\u0061\xff":1}',
+        b'{"first":0, "\\u0061\xff":1}',
+        b'{"first":0, "\xc3\xa9\\uD83D\\uDE00\xff":1}',
+    ],
+)
+def test_invalid_lookup_key_utf8_reports_original_byte_offset(raw: bytes):
+    projection = Projection(set())
+    offset = raw.index(b"\xff")
+    for split in range(len(raw) + 1):
+        with pytest.raises(ValueError, match=rf"byte {offset}:"):
+            run_chunks(projection, (raw[:split], raw[split:]))
 
 
 @pytest.mark.parametrize("negative", [False, True])

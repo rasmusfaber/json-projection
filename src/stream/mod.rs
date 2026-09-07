@@ -352,10 +352,14 @@ impl Engine {
                 let key = match parser.next_str() {
                     Ok(key) => key,
                     Err(error) => {
+                        // Jiter's UTF-8 error index can refer to its decoded key tape.
+                        let index = std::str::from_utf8(&self.key)
+                            .err()
+                            .map_or(error.index, |error| error.valid_up_to());
                         return Err(Error::Parse {
-                            offset: token.start + error.index,
+                            offset: token.start + index,
                             message: "invalid JSON object key".to_owned(),
-                        })
+                        });
                     }
                 };
                 let Node::Object(fields) = self.plan.node(node) else {

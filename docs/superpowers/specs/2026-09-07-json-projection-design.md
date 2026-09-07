@@ -206,9 +206,12 @@ noted in the README.
 
 ## Documentation
 
-README: problem statement, install, two-line usage, pydantic example, the
-benchmark table (12 shapes, naive vs projector vs pydantic-core patch), a
-"when it helps and when it costs" paragraph, and a "what you give up" section
+README: problem statement, install, two-line usage, pydantic example, a
+benchmark table drawn from `benchmarks/results.md` (naive vs schema
+projection vs schema projection plus byte projection; the earlier comparison
+against the unmerged pydantic-core patch stays in the research notes, not in
+this repo), a "when it helps and when it costs" paragraph, and a "what you
+give up" section
 covering: error payloads show the projected document; UTF-8 in dropped data is
 unchecked; the depth-200 edge; kept data is copied once; partial instances and
 union-member models. CHANGELOG from 0.1.0.

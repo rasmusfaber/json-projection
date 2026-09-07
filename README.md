@@ -18,8 +18,6 @@ For payloads whose bulk sits under unwanted keys that is most of the cost:
 | kubernetes-like list, drop spec/status (S12) | 9.794 ms / 18.52 MiB | 1.363 ms / 0.51 MiB |
 | everything kept, nothing to skip (S7) | 5.922 ms / 8.50 MiB | 7.006 ms / 9.91 MiB |
 
-Full table and method in [`benchmarks/results.md`](benchmarks/results.md).
-
 ## Install
 
     pip install json-projection              # projector only
@@ -102,8 +100,7 @@ copied or discarded subtrees is left to the downstream parser, matching the whol
 Discarded strings, numbers, and containers are never buffered in full. Memory is used for the caller's chunk,
 the nesting stack, the longest lookup key, and the **retained JSON output**. The output is buffered until
 `finish()`; creating the returned Python bytes briefly requires a second output buffer. Keeping most of a
-large document therefore still takes substantial memory. See the [streaming benchmarks](benchmarks/stream-results.md)
-for measured CPU and memory tradeoffs.
+large document therefore still takes substantial memory.
 
 ### With pydantic
 

@@ -104,7 +104,11 @@ def _sample(rng: random.Random, sid: int) -> dict[str, Any]:
     doc: dict[str, Any] = {"id": sid}
     if rng.random() < 0.5:
         doc["store"] = {"blob": [rng.random() for _ in range(5)]}
-    if rng.random() < 0.5:
+    if rng.random() < 0.04:
+        # both spellings at once: `migrate` rejects it, so plain validation rejects the whole document
+        doc["score"] = rng.random()
+        doc["scores"] = {"acc": rng.random()}
+    elif rng.random() < 0.5:
         doc["score"] = rng.random()  # legacy single score
     elif rng.random() < 0.7:
         doc["scores"] = {"acc": rng.random()}

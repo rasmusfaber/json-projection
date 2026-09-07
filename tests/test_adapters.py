@@ -1,7 +1,7 @@
 """Projection adapters: projecting through models with migration (before/wrap) validators."""
 
 import json
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Any, Literal, Optional, Union
 
 import pytest
 from pydantic import (
@@ -366,3 +366,81 @@ def test_a_non_conflicting_adapter_inside_a_union_still_validates():
     item = thin.validate_json(raw).item
     assert isinstance(item, Tagged)
     assert item.total == 5 and item.junk == {}  # the migration ran on everything it needs
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [[("old", "__all__"), ("old", "other")], [("old", "other"), ("old", "__all__")]],
+    ids=["all-first", "all-last"],
+)
+def test_an_all_segment_keeps_its_container_whole_whatever_the_order(paths: list[tuple[str, ...]]):
+    spec = projection_spec(Item, set(), projection_adapters={Item: migration_adapter(controls=paths)})
+    assert spec == {"id": True, "blob": True, "old": True}
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"inputs": {"id": "old_id"}},
+        {"controls": "old_id"},
+        {"requires": {"id": "blob"}},
+    ],
+    ids=["inputs", "controls", "requires"],
+)
+def test_a_bare_str_where_a_collection_is_expected_is_refused(kwargs: dict[str, Any]):
+    with pytest.raises(TypeError, match="not a str"):
+        migration_adapter(**kwargs)
+
+
+def test_a_path_cannot_start_with_all():
+    with pytest.raises(TypeError, match='cannot start with "__all__"'):
+        migration_adapter(controls=[("__all__", "x")])
+
+
+def test_complete_is_read_only():
+    thin = Projected(Legacy, {"payload"}, projection_adapters=ADAPTERS)
+    assert thin.complete is False
+    with pytest.raises(AttributeError):
+        thin.complete = True  # type: ignore[misc]
+    assert thin.complete is False
+
+
+class Twice(BaseModel):
+    """Using `Legacy` twice makes pydantic hoist it into `definitions` and refer to it by ref."""
+
+    a: Legacy
+    b: Optional[Legacy] = None
+
+
+def test_an_adapted_class_is_reached_through_a_definition_ref():
+    assert Twice.__pydantic_core_schema__["type"] == "definitions"
+    spec = projection_spec(Twice, {Legacy: {"payload"}}, projection_adapters=ADAPTERS)
+    inner = {"name": True, "items": {"__all__": {"id": True, "blob": True}}, "old_name": True}
+    assert spec == {"a": inner, "b": inner}
+
+
+class SubLegacy(Legacy):
+    """Inherits `Legacy.migrate`; the adapter must be registered for this exact class."""
+
+    extra_note: str = ""
+
+
+def test_a_subclass_inherits_the_validators_and_takes_its_own_adapter():
+    thin = Projected(SubLegacy, {"payload"}, projection_adapters={SubLegacy: legacy_adapter})
+    got = thin.validate_json(b'{"old_name": "n", "extra_note": "e", "payload": {"big": true}}')
+    assert (got.name, got.extra_note, got.payload) == ("n", "e", {})
+
+
+def test_each_occurrence_gets_a_fresh_context_spec():
+    seen: list[dict[str, Any]] = []
+
+    def record(ctx: AdapterContext) -> dict[str, Any]:
+        assert not any(k.startswith("mark") for k in ctx.spec)  # nothing left over from the last call
+        ctx.spec[f"mark{len(seen)}"] = True
+        seen.append(ctx.spec)
+        return ctx.spec
+
+    spec = projection_spec(Twice, {Legacy: {"payload"}}, projection_adapters={Legacy: record})
+    assert len(seen) == 2 and seen[0] is not seen[1]
+    assert spec["a"]["mark0"] is True and "mark1" not in spec["a"]
+    assert spec["b"]["mark1"] is True and "mark0" not in spec["b"]

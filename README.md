@@ -146,9 +146,12 @@ thin = Projected(
 `Projected(...)` raise `ValueError`. With the inspect_ai adapters that means `timelines` must go whenever
 `events` does. Anything the helper cannot express is a plain callable
 `adapter(ctx: AdapterContext) -> Mapping[str, Any]`: `ctx.fields` are the retained field names and
-`ctx.spec` the projection derived for them, to modify and return. Adapters run once per occurrence of the
-class and must be pure. The validators themselves still perform the migration; the projection only makes
-sure they see what they need.
+`ctx.spec` the projection derived for them, to modify and return -- a fresh dict per occurrence. Adapters
+run once per occurrence of the class, including occurrences inside subtrees the projection has to keep
+whole (there the derived spec is discarded, but a `requires` conflict is still reported), and must be
+pure. A bare string where a collection of paths or names is expected -- `inputs={"name": "old_name"}`,
+`controls="version"`, `requires={"a": "b"}` -- is a `TypeError`: it would iterate as characters. The
+validators themselves still perform the migration; the projection only makes sure they see what they need.
 
 Adapters are looked up by **exact class**: a subclass needs its own entry, and registering one for a class
 that does not appear in the root model's schema raises `ValueError` rather than going silently unused. The
@@ -212,7 +215,9 @@ an excluded key from the inputs it was given. `examples/inspect_adapters.py` hol
   would touch it or anything below it: pydantic-core calls that `__init__`, which validates through the
   class's original validator and ignores the exclusion entirely.
 - **A field aliased `__all__`** cannot be expressed: `__all__` is the array wildcard in a mapping spec, so a
-  derived spec containing it is rejected with `TypeError`.
+  derived spec containing it is rejected with `TypeError`. In a `migration_adapter` path the segment means
+  "keep that container whole", so the path is truncated there; a path that *starts* with `__all__` would ask
+  for the whole root object, which no spec can say, and raises `TypeError` at construction.
 - **Data-dependent defaults and computed fields.** A `default_factory` that takes the validated data raises a
   plain `KeyError` from `validate_json` when it reads an excluded field, and a computed field that reads an
   excluded attribute raises `AttributeError` from `model_dump`. Neither becomes a `ValidationError`.

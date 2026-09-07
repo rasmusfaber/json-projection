@@ -384,11 +384,19 @@ KeyPath = Union[str, tuple[str, ...]]  # noqa: UP007  (runtime alias must work o
 
 
 def _key_path(path: KeyPath) -> tuple[str, ...]:
+    """One path, validated. A segment named `__all__` means "keep that container whole".
+
+    `__all__` is the array wildcard of the spec grammar, so it cannot also be an ordinary key inside a
+    path: `("old", "__all__")` becomes `("old",)`, which keeps `old` whole however the paths are
+    ordered. A path that starts with it would ask for the root object, which no spec can express.
+    """
     if isinstance(path, str):
-        return (path,)
-    if isinstance(path, tuple) and path and all(isinstance(seg, str) for seg in path):
-        return path
-    raise TypeError(f"a path is a JSON key or a tuple of keys, not {path!r}")
+        path = (path,)
+    elif not (isinstance(path, tuple) and path and all(isinstance(seg, str) for seg in path)):
+        raise TypeError(f"a path is a JSON key or a tuple of keys, not {path!r}")
+    if path[0] == "__all__":
+        raise TypeError('a path cannot start with "__all__": the root object cannot be kept whole')
+    return path[: path.index("__all__")] if "__all__" in path else path
 
 
 def _keep_path(spec: dict[str, Any], path: tuple[str, ...]) -> None:
@@ -410,6 +418,13 @@ def _keep_path(spec: dict[str, Any], path: tuple[str, ...]) -> None:
     node[path[-1]] = True
 
 
+def _collection(value: Any, what: str) -> Any:
+    """A bare `str` here is an iterable of characters, never what the caller meant."""
+    if isinstance(value, str):
+        raise TypeError(f"{what} must be a collection of names or paths, not a str: {value!r}")
+    return value
+
+
 def migration_adapter(
     *,
     inputs: Mapping[str, Iterable[KeyPath]] | None = None,
@@ -424,10 +439,19 @@ def migration_adapter(
     exclusion. `requires`: retained field -> retained fields it depends on; a dependency that is excluded
     is a `ValueError` at construction of the projection. Field names that the class does not declare are
     a `ValueError` too.
+
+    A bare `str` where a collection of paths or names is expected is a `TypeError`: it would iterate as
+    characters. A path segment named `__all__` truncates the path there, keeping that container whole.
     """
-    input_paths = {field: [_key_path(p) for p in paths] for field, paths in (inputs or {}).items()}
-    control_paths = [_key_path(p) for p in controls]
-    dependencies = {field: list(deps) for field, deps in (requires or {}).items()}
+    input_paths = {
+        field: [_key_path(p) for p in _collection(paths, f"the input paths for {field!r}")]
+        for field, paths in (inputs or {}).items()
+    }
+    control_paths = [_key_path(p) for p in _collection(controls, "controls")]
+    dependencies = {
+        field: list(_collection(deps, f"the dependencies of {field!r}"))
+        for field, deps in (requires or {}).items()
+    }
 
     def adapter(ctx: AdapterContext) -> dict[str, Any]:
         declared = set(ctx.model.model_fields)
@@ -666,10 +690,24 @@ class Projected:
         self.model = model
         self.exclude = normalize_exclude(model, exclude)
         self.projection_adapters: dict[type, ProjectionAdapter] = dict(projection_adapters or {})
-        spec, self.complete = _derive_spec(model, self.exclude, self.projection_adapters)
+        spec, self._complete = _derive_spec(model, self.exclude, self.projection_adapters)
         # the guards in projected_validator are only unnecessary when the projection removes every occurrence
-        self.validator = projected_validator(model, self.exclude, assume_projected=self.complete)
+        self.validator = projected_validator(model, self.exclude, assume_projected=self._complete)
         self.spec = Projection(spec)
+
+    @property
+    def complete(self) -> bool:
+        """Whether the projection provably removes every excluded key, everywhere.
+
+        A conservative proof, not a measurement: `True` only when every occurrence of every excluded
+        class is described by the derived spec, so no excluded key can survive projection and no
+        migration validator can recreate one from what did. `False` whenever an excluded class sits
+        inside a kept-whole subtree, or below a class whose adapter kept inputs a migration could
+        rebuild it from. Read-only: it decides whether the `projected_validator` config guards are
+        dropped and whether `validate_json` accepts `by_name`, and lowering the bar after construction
+        would not make either safe.
+        """
+        return self._complete
 
     def validate_json(
         self,
@@ -684,9 +722,10 @@ class Projected:
             # an excluded field with a default keeps its key inside every subtree the projection had to
             # keep whole; validating by name reads it there and the default is never applied
             raise ValueError(
-                f"{self.model.__qualname__}: the projection could not remove every excluded key (it "
-                "keeps some subtrees whole), so validating by name would read the excluded keys that "
-                "are left. Drop by_name/by_alias, or exclude nothing inside those subtrees."
+                f"{self.model.__qualname__}: the projection cannot prove that every excluded key is "
+                "gone -- it keeps some subtrees whole, or a migration validator could recreate a key "
+                "from the inputs an adapter kept -- so validating by name would read an excluded key "
+                "that is left. Drop by_name/by_alias, or exclude nothing inside those subtrees."
             )
         return self.validator.validate_json(
             self.spec(data), strict=strict, context=context, by_alias=by_alias, by_name=by_name

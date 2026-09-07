@@ -25,7 +25,7 @@ CANDIDATES = [
 @pytest.mark.parametrize("seed", [1, 2, 3])
 def test_projected_validation_matches_plain_validation_on_retained_fields(seed: int):
     rng = random.Random(seed)
-    checked = rejected = 0
+    checked = rejected = skipped = 0
     for _ in range(400):
         excluded: dict[type, set[str]] = {}
         for cls, name in CANDIDATES:
@@ -43,8 +43,9 @@ def test_projected_validation_matches_plain_validation_on_retained_fields(seed: 
         try:
             plain = Log.model_validate_json(doc)
         except ValidationError:
+            skipped += 1  # a document ordinary validation rejects says nothing about the projection
             continue
         norm = {cls: frozenset(names) for cls, names in excluded.items()}
         assert retained_dump(thin.validate_json(doc), norm) == retained_dump(plain, norm), (excluded, doc)
         checked += 1
-    assert checked >= 200 and rejected >= 10, (checked, rejected)
+    assert checked >= 200 and rejected >= 10 and skipped >= 1, (checked, rejected, skipped)

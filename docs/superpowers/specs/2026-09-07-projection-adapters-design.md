@@ -116,8 +116,16 @@ stays `True` (the subtree is kept whole); the leaf becomes `True`; any conflict 
 `{"__all__": ...}` spec, or a leaf that meets a nested mapping) widens that node to `True`. Widening only
 ever keeps more, so it is always safe.
 
+A path segment named `__all__` truncates the path there, keeping that container whole, so the merged
+result does not depend on the order the paths are given in; a path that starts with `__all__` asks for
+the root object and is a `TypeError` at construction. A bare `str` where a collection of paths or names
+is expected (`inputs` values, `controls`, `requires` values) is a `TypeError` too, the same policy
+`normalize_exclude` applies to `exclude`: it would iterate as characters.
+
 Field names given to `inputs` or `requires` (keys and dependency values) that are not declared on
-`ctx.model` raise `ValueError` when the adapter runs, so typos surface at construction.
+`ctx.model` raise `ValueError` when the adapter runs, so typos surface at construction. Adapters are
+looked up by exact class; one registered for a class with no `model` node in the root's schema is a
+`ValueError`, so a subclass needs its own entry rather than silently inheriting the base class's.
 
 ## Derivation semantics
 
@@ -171,6 +179,9 @@ redirect otherwise); the config guards handle `extra='forbid'`/`'allow'` and by-
 derivation is incomplete in that situation.
 
 `Projected` stores `projection_adapters` and shows the adapted class names in its `repr`.
+`Projected.complete` is a read-only property: a conservative proof that the projection removes every
+excluded key everywhere, so no migration can recreate one either. It is what permits dropping the 0.1
+config guards, which is why it cannot be assigned after construction.
 
 ## Example: inspect_ai
 

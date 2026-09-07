@@ -62,10 +62,9 @@ def test_the_spec_fallback_survives_excluding_task_args():
     doc["eval"]["task_args"] = {"n": 3, "flag": True}  # the fixture's own task_args is empty
     raw = json.dumps(doc).encode()
     exclude = {EvalSample: BULK_FIELDS, EvalSpec: {"task_args"}}
-    plain = EvalLog.model_validate_json(raw, context=get_deserializing_context())
-    thin = Projected(EvalLog, exclude, projection_adapters=INSPECT_ADAPTERS).validate_json(
-        raw, context=get_deserializing_context()
-    )
+    ctx = get_deserializing_context()
+    plain = EvalLog.model_validate_json(raw, context=ctx)
+    thin = Projected(EvalLog, exclude, projection_adapters=INSPECT_ADAPTERS).validate_json(raw, context=ctx)
     assert plain.eval.task_args_passed == {"n": 3, "flag": True}
     assert thin.eval.task_args_passed == plain.eval.task_args_passed
     assert thin.eval.task_args == {}  # excluded: default applied, though the key was kept for the migration

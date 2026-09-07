@@ -1,12 +1,14 @@
+import dataclasses
 import importlib
 import math
 import sys
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, Union
 from unittest import mock
 
 import pydantic
 import pytest
-from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field, field_validator, model_validator
+from typing_extensions import TypedDict
 
 from json_projection import project
 from json_projection.pydantic import Projected, projected_validator, projection_spec
@@ -419,3 +421,179 @@ def test_an_excluded_class_below_an_allow_model_keeps_the_guards():
 
     with pytest.raises(ValueError, match="Deep"):
         Projected(Plain, {Plain: {"junk"}, Deep: {"secret"}})
+
+
+def _child(**config: Any) -> type[BaseModel]:
+    class Child(BaseModel):
+        model_config = ConfigDict(**config)  # type: ignore[typeddict-item]
+        keep: int
+        secret: int = 0
+
+    return Child
+
+
+def _dict_shape(Child):
+    class Outer(BaseModel):
+        children: dict[str, Child]  # type: ignore[valid-type]
+
+    return Outer, b'{"children":{"a":{"keep":1,"secret":9}}}', lambda o: o.children["a"]
+
+
+def _union_shape(Child):
+    class Outer(BaseModel):
+        u: Union[Child, int]  # type: ignore[valid-type]
+
+    return Outer, b'{"u":{"keep":1,"secret":9}}', lambda o: o.u
+
+
+def _fixed_tuple_shape(Child):
+    class Outer(BaseModel):
+        t: tuple[Child, int]  # type: ignore[valid-type]
+
+    return Outer, b'{"t":[{"keep":1,"secret":9},2]}', lambda o: o.t[0]
+
+
+def _dataclass_shape(Child):
+    @dataclasses.dataclass
+    class DC:
+        c: Child  # type: ignore[valid-type]
+
+    class Outer(BaseModel):
+        d: DC
+
+    return Outer, b'{"d":{"c":{"keep":1,"secret":9}}}', lambda o: o.d.c
+
+
+def _typeddict_shape(Child):
+    class TD(TypedDict):
+        c: Child  # type: ignore[valid-type]
+
+    class Outer(BaseModel):
+        t: TD
+
+    return Outer, b'{"t":{"c":{"keep":1,"secret":9}}}', lambda o: o.t["c"]
+
+
+def _alias_path_shape(Child):
+    class Outer(BaseModel):
+        c: Child = Field(validation_alias=AliasPath("a", "b"))  # type: ignore[valid-type]
+
+    return Outer, b'{"a":{"b":{"keep":1,"secret":9}}}', lambda o: o.c
+
+
+def _collision_shape(Child):
+    class Outer(BaseModel):
+        x: dict[str, Any]
+        c: Child = Field(validation_alias="x")  # type: ignore[valid-type]
+
+    return Outer, b'{"x":{"keep":1,"secret":9}}', lambda o: o.c
+
+
+def _before_validator_shape(Child):
+    class Outer(BaseModel):
+        c: Child  # type: ignore[valid-type]
+
+        @field_validator("c", mode="before")
+        @classmethod
+        def pre(cls, value):
+            return value
+
+    return Outer, b'{"c":{"keep":1,"secret":9}}', lambda o: o.c
+
+
+def _wrap_validator_shape(Child):
+    class Outer(BaseModel):
+        c: Child  # type: ignore[valid-type]
+
+        @field_validator("c", mode="wrap")
+        @classmethod
+        def around(cls, value, handler):
+            return handler(value)
+
+    return Outer, b'{"c":{"keep":1,"secret":9}}', lambda o: o.c
+
+
+def _allow_model_shape(Child):
+    class Loose(BaseModel):
+        model_config = ConfigDict(extra="allow")
+        c: Child  # type: ignore[valid-type]
+
+    class Outer(BaseModel):
+        inner: Loose
+
+    return Outer, b'{"inner":{"c":{"keep":1,"secret":9}}}', lambda o: o.inner.c
+
+
+SHAPES = {
+    "dict": _dict_shape,
+    "union": _union_shape,
+    "fixed_tuple": _fixed_tuple_shape,
+    "dataclass": _dataclass_shape,
+    "typeddict": _typeddict_shape,
+    "alias_path": _alias_path_shape,
+    "key_collision": _collision_shape,
+    "field_validator_before": _before_validator_shape,
+    "field_validator_wrap": _wrap_validator_shape,
+    "extra_allow_parent": _allow_model_shape,
+}
+
+
+@pytest.mark.parametrize("shape", sorted(SHAPES))
+def test_excluded_class_under_an_opaque_shape_still_gets_its_default(shape):
+    Child = _child()
+    Outer, raw, get = SHAPES[shape](Child)
+    child = get(Projected(Outer, {Child: {"secret"}}).validate_json(raw))
+    assert child.keep == 1, shape
+    assert child.secret == 0, shape  # the projection cannot reach it, but the validator ignores the key
+
+
+@pytest.mark.parametrize("shape", sorted(SHAPES))
+@pytest.mark.parametrize(
+    ("config", "match"),
+    [({"extra": "forbid"}, "forbid"), ({"extra": "allow"}, "allow"), ({"validate_by_name": True}, "by name")],
+)
+def test_excluded_class_under_an_opaque_shape_keeps_the_guards(shape, config, match):
+    Child = _child(**config)
+    Outer, _, _ = SHAPES[shape](Child)
+    with pytest.raises(ValueError, match=match):
+        Projected(Outer, {Child: {"secret"}})
+
+
+def test_field_before_validator_input_is_preserved():
+    class Child(BaseModel):
+        x: int
+
+    class Outer(BaseModel):
+        child: Child
+
+        @field_validator("child", mode="before")
+        @classmethod
+        def adapt(cls, value):
+            return {"x": value["source"]}
+
+    raw = b'{"child":{"source":1}}'
+    assert Projected(Outer, set()).validate_json(raw) == Outer.model_validate_json(raw)
+
+
+def test_root_model_before_validator_cannot_be_projected():
+    class Root(BaseModel):
+        x: int
+
+        @model_validator(mode="before")
+        @classmethod
+        def pre(cls, value):
+            return value
+
+    with pytest.raises(TypeError, match="function-before"):
+        Projected(Root, {"x"})
+    with pytest.raises(TypeError, match="function-wrap"):
+
+        class Wrapped(BaseModel):
+            x: int
+
+            @model_validator(mode="wrap")
+            @classmethod
+            def around(cls, value, handler):
+                return handler(value)
+
+        Projected(Wrapped, {"x"})

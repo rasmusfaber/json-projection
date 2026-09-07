@@ -60,12 +60,24 @@ def _extra(cls: type) -> Any:
     return getattr(cls, "model_config", {}).get("extra")
 
 
-def _fields_node(model_node: dict[str, Any]) -> dict[str, Any] | None:
-    """`model` -> ... -> `model-fields`, looking through function-validator wrappers."""
+_OPAQUE_WRAPPERS = ("function-before", "function-wrap", "function-plain")
+"""Validators whose input shape is unknown: the schema they wrap does not describe what they are given."""
+
+
+def _fields_node(model_node: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """`model` -> ... -> `model-fields`, looking through function-validator wrappers.
+
+    Returns the `model-fields` node and the kind of the first before/wrap/plain wrapper passed on the
+    way, which makes the fields useless for deriving a projection (the validator's input is not the
+    shape they describe).
+    """
     inner = model_node.get("schema")
+    opaque_kind: str | None = None
     while isinstance(inner, dict) and inner.get("type") != "model-fields":
+        if inner["type"] in _OPAQUE_WRAPPERS and opaque_kind is None:
+            opaque_kind = inner["type"]
         inner = inner.get("schema")
-    return inner if isinstance(inner, dict) else None
+    return (inner if isinstance(inner, dict) else None), opaque_kind
 
 
 def projected_validator(
@@ -81,8 +93,8 @@ def projected_validator(
     With ``assume_projected=False`` (validating raw input) classes whose configuration would still let
     pydantic read an excluded key are refused with ``ValueError``: ``extra='forbid'`` or ``extra='allow'``,
     and ``populate_by_name``/``validate_by_name`` when a field with a default is excluded. `Projected`
-    passes ``assume_projected=True`` when its derived projection covers every occurrence of every class
-    (no cut-off), because the byte projection then removes those keys before validation.
+    passes ``assume_projected=True`` only when its derived projection provably covers every occurrence
+    of every excluded class, because the byte projection then removes those keys before validation.
     """
     excluded = normalize_exclude(model, exclude)
     schema = _copy(model.__pydantic_core_schema__)
@@ -98,7 +110,7 @@ def projected_validator(
         names = excluded.get(cls)
         if not names:
             return
-        fields = _fields_node(node)
+        fields, _ = _fields_node(node)
         if fields is None:
             raise TypeError(
                 f"{cls.__qualname__}: no 'model-fields' under its 'model' node; core schema shape changed"
@@ -176,10 +188,12 @@ def _field_keys(name: str, alias: Any) -> list[tuple[str, bool]]:
 def _derive_spec(model: type[BaseModel], excluded: dict[type, frozenset[str]]) -> tuple[dict[str, Any], bool]:
     """The keep-spec for `model` minus `excluded`, and whether it covers every occurrence of every class.
 
-    The spec is cut off at a class that appears inside itself (a spec is a finite tree) and at an
-    `extra='allow'` class with no excluded fields of its own (its undeclared keys are data). Below such a
-    cut-off the projection keeps whole values, so `complete` is False when an excluded class can still be
-    reached there and the projection would therefore leave its keys in place.
+    Every shape the derivation cannot describe is kept whole instead: a class that appears inside itself
+    (a spec is a finite tree), an `extra='allow'` class with no excluded fields of its own (its
+    undeclared keys are data), a before/wrap/plain validator (its input is not the shape its inner
+    schema describes), and everything unknown (dicts, unions, fixed tuples, dataclasses, TypedDicts,
+    `Any`, enclosing objects named by a multi-segment alias path, colliding keys). Nothing below a kept
+    subtree is projected, so `complete` is False as soon as an excluded class is reachable in one.
     """
     schema: dict[str, Any] = cast("dict[str, Any]", model.__pydantic_core_schema__)
     definitions: dict[str, dict[str, Any]] = {}
@@ -190,6 +204,7 @@ def _derive_spec(model: type[BaseModel], excluded: dict[type, frozenset[str]]) -
 
     _walk(schema, _record_ref)
     complete = [True]
+    wrapper_kind: list[str] = []
 
     def reaches_excluded(node: dict[str, Any]) -> bool:
         """Whether an excluded class has a `model` node under `node`, following each ref once."""
@@ -210,25 +225,32 @@ def _derive_spec(model: type[BaseModel], excluded: dict[type, frozenset[str]]) -
             _walk(pending.pop(), look)
         return hit[0]
 
+    def opaque(node: dict[str, Any]) -> bool:
+        """Keep this subtree whole, and say so: `True`.
+
+        Every fallback goes through here. Below a kept subtree nothing is projected, so an excluded
+        class reachable in it keeps its keys and the derivation is no longer complete.
+        """
+        if reaches_excluded(node):
+            complete[0] = False
+        return True
+
     def spec_for(node: dict[str, Any], seen: frozenset[type]) -> Any:
         t = node.get("type")
         if t == "definitions":  # root of every model with recursive references
             return spec_for(node["schema"], seen)
         if t == "definition-ref":
             target = definitions.get(node["schema_ref"])
-            return True if target is None else spec_for(target, seen)
-        if t in (
-            "nullable",
-            "default",
-            "function-before",
-            "function-after",
-            "function-wrap",
-            "function-plain",
-        ):
-            return spec_for(node["schema"], seen) if isinstance(node.get("schema"), dict) else True
+            return opaque(node) if target is None else spec_for(target, seen)
+        if t in _OPAQUE_WRAPPERS:
+            wrapper_kind.append(t)
+            return opaque(node)
+        if t in ("nullable", "default", "function-after"):
+            # function-after runs on what the inner schema already validated, so that shape is known
+            return spec_for(node["schema"], seen) if isinstance(node.get("schema"), dict) else opaque(node)
         if t in ("list", "set", "frozenset"):
             if not isinstance(node.get("items_schema"), dict):
-                return True
+                return opaque(node)
             return {"__all__": spec_for(node["items_schema"], seen)}
         if (
             t == "tuple"
@@ -239,28 +261,35 @@ def _derive_spec(model: type[BaseModel], excluded: dict[type, frozenset[str]]) -
         if t == "model":
             cls = node["cls"]
             if cls in seen:
-                complete[0] = False
-                return True
+                return opaque(node)  # a class inside itself; a spec is a finite tree
             if _extra(cls) == "allow" and not excluded.get(cls):
-                # undeclared keys are data on this class, so keep the whole object. Only an excluded class
-                # below it loses out, its keys surviving the projection: a cut-off like recursion.
-                if reaches_excluded(node):
-                    complete[0] = False
-                return True
-            fields = _fields_node(node)
+                # undeclared keys are data on this class, so keep the whole object
+                return opaque(node)
+            fields, kind = _fields_node(node)
+            if kind is not None:
+                wrapper_kind.append(kind)
+                return opaque(node)
             if fields is None:
-                return True
+                return opaque(node)
             out: dict[str, Any] = {}
+            source: dict[str, dict[str, Any]] = {}  # the field schema each kept key came from
             for name, field in fields["fields"].items():
                 if name in excluded.get(cls, ()):
                     continue
-                sub = spec_for(field["schema"], seen | {cls})
+                fschema = field["schema"]
+                sub = spec_for(fschema, seen | {cls})
                 for key, direct in _field_keys(name, field.get("validation_alias")):
-                    value = sub if direct else True
-                    # two fields under one JSON key describe it differently: keep it whole
-                    out[key] = value if out.get(key, value) == value else True
+                    # a multi-segment alias path names an enclosing object, not the field's own value
+                    value = sub if direct else opaque(fschema)
+                    if out.get(key, value) != value:
+                        # two fields under one JSON key describe it differently: keep it whole
+                        value = True
+                        opaque(fschema)
+                        opaque(source[key])
+                    out[key] = value
+                    source[key] = fschema
             return out
-        return True  # dict, Any, unions, scalars: keep the value as-is
+        return opaque(node)  # dict, unions, fixed tuples, dataclasses, TypedDicts, Any, scalars
 
     root = spec_for(schema, frozenset())
     if not isinstance(root, dict):
@@ -268,6 +297,11 @@ def _derive_spec(model: type[BaseModel], excluded: dict[type, frozenset[str]]) -
             raise TypeError(
                 f"cannot derive a projection for {model.__qualname__}: it allows extra fields and none "
                 "of its own fields are excluded; exclude a field on it or use projected_validator alone"
+            )
+        if wrapper_kind:
+            raise TypeError(
+                f"cannot derive a projection for {model.__qualname__}: a {wrapper_kind[0]} validator "
+                "wraps its fields, so the shape of its input is unknown; use projected_validator alone"
             )
         raise TypeError(f"{model.__qualname__}: could not derive an object spec from its core schema")
     return root, complete[0]
@@ -284,10 +318,9 @@ class Projected:
     Combines a byte projection (unwanted members are skipped by the Rust cursor) with a validator built
     from the model's core schema minus the excluded fields. Results are instances of the original classes.
 
-    The projection stops at a model that appears inside itself and at an `extra='allow'` model with no
-    excluded fields of its own (whose undeclared keys are data). An excluded class below such a cut-off
-    still sees its keys, so it must use `extra='ignore'`, and an excluded field with a default must not be
-    populated by name; `projected_validator` raises `ValueError` otherwise.
+    The projection keeps whole every subtree it cannot describe (see `_derive_spec`). An excluded class
+    inside one still sees its keys, so it must use `extra='ignore'`, and an excluded field with a default
+    must not be populated by name; `projected_validator` raises `ValueError` otherwise.
     """
 
     def __init__(self, model: type[BaseModel], exclude: Exclude) -> None:

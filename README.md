@@ -74,3 +74,13 @@ parses it next reports the error at the original position. Pass `strict=True` to
 
 CPython 3.9 to 3.14 (one abi3 wheel per platform); Linux x86_64 and aarch64, macOS, Windows. Free-threaded
 builds are not supported yet.
+
+## Releasing
+
+1. Bump `version` in `Cargo.toml`, move the changelog entry from "unreleased" to the date, commit.
+2. `git tag vX.Y.Z && git push --tags`. The release workflow builds wheels for Linux x86_64/aarch64, macOS
+   arm64/x86_64 and Windows x64 plus the sdist, and publishes via PyPI trusted publishing.
+
+One-time setup before the first tag: create the `json-projection` project on PyPI, add a trusted publisher for
+`rasmusfaber/json-projection` with workflow `release.yml` and environment `pypi`, and create the `pypi`
+environment in the GitHub repository settings.

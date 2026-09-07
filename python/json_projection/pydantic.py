@@ -73,14 +73,16 @@ def projected_validator(
 ) -> SchemaValidator:
     """A validator for `model` that never reads the excluded fields.
 
-    Excluded fields with a default keep their default. Excluded required fields are absent from the
-    resulting instances (and from ``model_fields_set``). Instances are of the original classes.
+    Excluded fields with a default keep their default: their key becomes the alias
+    ``\\x00excluded:<name>``, which no ordinary document contains, so a document that does contain that
+    literal key still populates the field (`Projected` strips it). Excluded required fields are absent
+    from the resulting instances (and from ``model_fields_set``). Instances are of the original classes.
 
     With ``assume_projected=False`` (validating raw input) classes whose configuration would still let
     pydantic read an excluded key are refused with ``ValueError``: ``extra='forbid'`` or ``extra='allow'``,
     and ``populate_by_name``/``validate_by_name`` when a field with a default is excluded. `Projected`
     passes ``assume_projected=True`` when its derived projection covers every occurrence of every class
-    (no recursion cut-off), because the byte projection then removes those keys before validation.
+    (no cut-off), because the byte projection then removes those keys before validation.
     """
     excluded = normalize_exclude(model, exclude)
     schema = _copy(model.__pydantic_core_schema__)
@@ -126,7 +128,8 @@ def projected_validator(
                         "still be read under its name"
                     )
             if has_default:
-                # keep the field but make its JSON key unreachable so pydantic applies the default
+                # keep the field but look for it under an alias no ordinary document contains, so that
+                # pydantic applies the default
                 field["validation_alias"] = _EXCLUDED_ALIAS_PREFIX + name
             else:
                 fields["fields"].pop(name)
@@ -260,8 +263,9 @@ class Projected:
     Combines a byte projection (unwanted members are skipped by the Rust cursor) with a validator built
     from the model's core schema minus the excluded fields. Results are instances of the original classes.
 
-    For a model that appears inside itself the projection stops at the first recursion, so excluded keys
-    deeper down still reach the validator; such models must use `extra='ignore'`, and an excluded field
+    The projection stops at a model that appears inside itself and at an `extra='allow'` model with no
+    excluded fields of its own (whose undeclared keys are data), so excluded keys below such a cut-off
+    still reach the validator; every excluded class must then use `extra='ignore'`, and an excluded field
     with a default must not be populated by name. `projected_validator` raises `ValueError` otherwise.
     """
 

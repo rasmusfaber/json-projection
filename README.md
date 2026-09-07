@@ -64,6 +64,20 @@ set means the root model.
   which pydantic does not promise to keep. CI tests the latest release and pre-release; a `RuntimeError` is
   raised if pydantic-core ignores the schema edit.
 - **Refused configurations.** `projected_validator` on its own refuses, with `ValueError`, models whose config would still consume an excluded key: `extra='forbid'` or `extra='allow'`, and `populate_by_name`/`validate_by_name` when an excluded field has a default. `Projected` lifts that restriction because its byte projection removes the key first, except for recursive models where the derived spec cannot reach every occurrence; those stay refused.
+- **Before/wrap model validators.** A `model_validator(mode='before')` or `mode='wrap'` that reads keys the
+  model does not declare will not see them: the projection keeps only declared fields. Exclude nothing on such
+  a model or use `projected_validator` alone.
+- **After validators and excluded required fields.** A `model_validator(mode='after')` that touches an excluded
+  required field raises `AttributeError` from `validate_json`, not a `ValidationError`.
+- **Extras.** A model with `extra='allow'` that has no excluded field of its own is kept whole (nothing below it
+  is projected). A model with `extra='allow'` that does have excluded fields loses all its extras: the
+  projection keeps only declared fields.
+- **Standalone `projected_validator`.** Excluded fields with a default are redirected to the alias
+  `\x00excluded:<name>`; a document that contains that literal key still populates the field. `Projected`
+  strips it.
+- **Recursion.** When any model in the schema recurses, the derived projection stops at the first repetition and
+  `Projected` keeps the standalone guards on for every class in the schema, so a non-recursive `extra='forbid'`
+  root is refused if an unrelated recursive class is nested under it.
 
 ## Errors
 

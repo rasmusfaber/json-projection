@@ -1,14 +1,18 @@
 """Projection adapters: projecting through models with migration (before/wrap) validators."""
 
 import json
+import time
+from collections import Counter
 from typing import Annotated, Any, Literal, Optional, Union
 
 import pytest
 from pydantic import (
+    AliasPath,
     BaseModel,
     BeforeValidator,
     ConfigDict,
     Field,
+    create_model,
     field_validator,
     model_validator,
 )
@@ -444,3 +448,52 @@ def test_each_occurrence_gets_a_fresh_context_spec():
     assert len(seen) == 2 and seen[0] is not seen[1]
     assert spec["a"]["mark0"] is True and "mark1" not in spec["a"]
     assert spec["b"]["mark1"] is True and "mark0" not in spec["b"]
+
+
+def _dict_chain(depth: int) -> tuple[type[BaseModel], list[type[BaseModel]]]:
+    """`Root.kids: dict[str, N{depth-1}]`, each `N{i}.kids: dict[str, N{i-1}]`, `N0.value: int`.
+
+    Every dict value is a subtree the derivation keeps whole, so every level is a discard pass.
+    """
+    models: list[type[BaseModel]] = [create_model("N0", value=(int, 0))]
+    for i in range(1, depth):
+        models.append(create_model(f"N{i}", kids=(dict[str, models[-1]], {})))
+    root = create_model("Root", kids=(dict[str, models[-1]], {}))
+    return root, [*models, root]
+
+
+def test_a_discarded_derivation_is_shared_across_nesting_levels():
+    root, models = _dict_chain(10)
+    calls: Counter[type] = Counter()
+
+    def record(ctx: AdapterContext) -> dict[str, Any]:
+        calls[ctx.model] += 1
+        return ctx.spec
+
+    assert projection_spec(root, set(), projection_adapters={m: record for m in models}) == {"kids": True}
+    assert calls == Counter(models)  # exactly one call per class, not one per path to it
+
+
+def test_nested_discarded_derivations_do_not_blow_up():
+    root, models = _dict_chain(16)
+    adapters = {m: migration_adapter() for m in models}
+    start = time.perf_counter()
+    projection_spec(root, set(), projection_adapters=adapters)
+    assert time.perf_counter() - start < 0.5  # 2**16 adapter calls took a second and a half
+
+
+class AliasHolder(BaseModel):
+    """The alias path names an enclosing object, so the field's own schema is kept whole as well."""
+
+    leaf: Legacy = Field(default=None, validation_alias=AliasPath("outer", "leaf"))  # type: ignore[assignment]
+
+
+def test_a_field_behind_an_alias_path_calls_its_adapter_once():
+    calls: Counter[type] = Counter()
+
+    def record(ctx: AdapterContext) -> dict[str, Any]:
+        calls[ctx.model] += 1
+        return ctx.spec
+
+    projection_spec(AliasHolder, {Legacy: {"payload"}}, projection_adapters={Legacy: record})
+    assert calls == Counter({Legacy: 1})

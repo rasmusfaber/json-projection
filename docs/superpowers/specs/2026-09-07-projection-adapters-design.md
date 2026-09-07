@@ -166,9 +166,12 @@ opaque fallback:
 `function-plain` stays opaque even with an adapter: it replaces validation entirely, so there are no
 fields to retain.
 
-Every kept-whole subtree is still searched for adapted classes (following each `definition-ref` once,
-and skipping classes the derivation is already inside), and each one found is derived once and the
-result discarded. Keeping the bytes whole answers "what survives projection", not "can this migration
+Every kept-whole subtree is still searched for adapted classes (following each `definition-ref` once),
+and each one found is derived once and the result discarded. "Once" is per derivation, not per subtree:
+a class the derivation has already entered -- for real or to discard -- is skipped, because deriving it
+already walked its own descendants. Without that, each nesting level would redo every level below it,
+which costs 2**N adapter calls for N nested kept-whole layers. A field the surrounding model has just
+derived for real is likewise not searched again; only its completeness is recorded. Keeping the bytes whole answers "what survives projection", not "can this migration
 live with these exclusions": an adapter's `requires` conflict, unknown field name or hand-written
 refusal must be reported wherever its class occurs, not only where the projection reaches. The discarded
 derivation cannot add keys to the spec; it can only make `complete` more conservative.

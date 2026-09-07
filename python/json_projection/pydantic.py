@@ -505,28 +505,38 @@ def _derive_spec(
     complete = [True]
     wrapper_kind: list[str] = []
     foreign: list[tuple[str, type]] = []  # (wrapper kind, adapted class) for wrappers it does not own
+    derived: set[type] = set()  # classes this call has already derived, for real or to discard
 
-    def opaque(node: dict[str, Any], seen: frozenset[type]) -> bool:
+    def kept(node: dict[str, Any]) -> bool:
         """Keep this subtree whole, and say so: `True`.
 
-        Every fallback goes through here. Below a kept subtree nothing is projected, so an excluded
-        class reachable in it keeps its keys and the derivation is no longer complete.
-
-        Adapted classes in the subtree are still derived, once per class, and the result thrown away.
-        An adapter has to see every occurrence of its class: keeping the bytes whole answers "what
-        survives projection", not "can this migration live with these exclusions", and a `requires`
-        conflict or a misspelt field name must be reported wherever the class appears, not only where
-        the projection happens to reach. `seen` stops the derivation from re-entering a class it is
-        already inside.
+        Below a kept subtree nothing is projected, so an excluded class reachable in it keeps its keys
+        and the derivation is no longer complete. Use this where the subtree's adapters have already
+        been run -- a field the loop below has just derived for real -- and `opaque` otherwise.
         """
         if _reaches_excluded(node, definitions, excluded):
             complete[0] = False
-        derived: set[type] = set()
+        return True
+
+    def opaque(node: dict[str, Any], seen: frozenset[type]) -> bool:
+        """Keep this subtree whole, and derive the adapted classes in it for their errors alone.
+
+        Every fallback goes through here. An adapter has to see every occurrence of its class: keeping
+        the bytes whole answers "what survives projection", not "can this migration live with these
+        exclusions", and a `requires` conflict or a misspelt field name must be reported wherever the
+        class appears, not only where the projection happens to reach. The spec that comes back is
+        thrown away.
+
+        `derived` makes that pass linear. A class is derived once per call, and deriving it already
+        walked its own descendants, so a nested subtree's classes are all in `derived` by the time an
+        enclosing subtree gets to them -- without that, each level would redo every level below it,
+        which costs 2**N adapter calls for N nested layers. It subsumes the `seen` ancestry check too:
+        the model branch adds a class to `derived` before it adds it to `seen`.
+        """
+        kept(node)
         for model_node in _subtree_models(node, definitions):
-            cls = model_node["cls"]
-            if cls in adapters and cls not in seen and cls not in derived:
-                derived.add(cls)
-                spec_for(model_node, seen)
+            if model_node["cls"] in adapters and model_node["cls"] not in derived:
+                spec_for(model_node, seen)  # marks it derived on the way in
         return True
 
     def spec_for(node: dict[str, Any], seen: frozenset[type]) -> Any:
@@ -562,6 +572,7 @@ def _derive_spec(
             return {"__all__": spec_for(node["items_schema"][0], seen)}  # tuple[X, ...]
         if t == "model":
             cls = node["cls"]
+            derived.add(cls)  # before anything below can ask for it again
             inner = seen | {cls}  # a fallback on this class must not derive it again
             if cls in seen:
                 return opaque(node, inner)  # a class inside itself; a spec is a finite tree
@@ -585,13 +596,15 @@ def _derive_spec(
                 fschema = field["schema"]
                 sub = spec_for(fschema, inner)
                 for key, direct in _field_keys(name, field.get("validation_alias")):
-                    # a multi-segment alias path names an enclosing object, not the field's own value
-                    value = sub if direct else opaque(fschema, inner)
+                    # a multi-segment alias path names an enclosing object, not the field's own value.
+                    # `kept`, not `opaque`: these schemas have been derived for real already, so a
+                    # discard pass over them would only call their adapters a second time
+                    value = sub if direct else kept(fschema)
                     if out.get(key, value) != value:
                         # two fields under one JSON key describe it differently: keep it whole
                         value = True
-                        opaque(fschema, inner)
-                        opaque(source[key], inner)
+                        kept(fschema)
+                        kept(source[key])
                     out[key] = value
                     source[key] = fschema
             if adapter is None:

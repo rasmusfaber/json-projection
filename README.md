@@ -115,6 +115,58 @@ Excluded fields that have a default keep their default. Excluded required fields
 and from `model_fields_set`. `exclude` is keyed by class so nested third-party models can be targeted; a plain
 set means the root model.
 
+### Migration validators
+
+A model whose fields sit behind a `model_validator(mode='before')` or `mode='wrap'` reads keys the schema
+does not declare: an old field name, a legacy `transcript` object, a `version` it dispatches on. The
+projection cannot know those keys, so such a class is kept whole -- or refused at the root -- unless you
+register a *projection adapter* that translates the fields retained after validation into the JSON inputs
+the validators need:
+
+```python
+from json_projection.pydantic import Projected, migration_adapter
+
+sample_adapter = migration_adapter(
+    inputs={  # retained field -> JSON paths a migration may read for it
+        "scores": ["score"],  # legacy single score
+        "events": [("transcript", "events")],  # legacy transcript held events and attachments
+        "attachments": [("transcript", "content")],
+    },
+    controls=["version"],  # keys a validator dispatches on: kept whenever present
+    requires={"timelines": ["events"]},  # retained field -> retained fields it depends on
+)
+
+thin = Projected(
+    Log,
+    # timelines go with events: the declared dependency refuses one without the other
+    exclude={Sample: {"events", "attachments", "timelines"}},
+    projection_adapters={Sample: sample_adapter},
+)
+```
+
+`inputs` are merged only for retained fields, so excluding `events` and `attachments` also drops
+`transcript`. `controls` are kept whenever present. Retaining a field whose dependency is excluded makes
+`Projected(...)` raise `ValueError`, which is why the example above must drop `timelines` too; with the
+inspect_ai adapters, likewise, `timelines` must go whenever `events` does. Anything the helper cannot
+express is a plain callable
+`adapter(ctx: AdapterContext) -> Mapping[str, Any]`: `ctx.fields` are the retained field names and
+`ctx.spec` the projection derived for them, to modify and return -- a fresh dict per occurrence. Adapters
+run once per occurrence of the class, including occurrences inside subtrees the projection has to keep
+whole (there the derived spec is discarded, but a `requires` conflict is still reported), and must be
+pure. A bare string where a collection of paths or names is expected -- `inputs={"name": "old_name"}`,
+`controls="version"`, `requires={"a": "b"}` -- is a `TypeError`: it would iterate as characters. The
+validators themselves still perform the migration; the projection only makes sure they see what they need.
+
+Adapters are looked up by **exact class**: a subclass needs its own entry, and registering one for a class
+that does not appear in the root model's schema raises `ValueError` naming the offending classes rather
+than going silently unused -- so a registry shared across roots has to be filtered when you root at a
+subtree class: `{c: a for c, a in REGISTRY.items() if c in {Sample, ...}}`. The same adapter object can of
+course be registered under several classes.
+
+Adapted classes keep the config guards on (see "Refused configurations") because a migration can recreate
+an excluded key from the inputs it was given. `examples/inspect_adapters.py` holds adapters for inspect_ai's
+`EvalLog`.
+
 ## What you give up
 
 - **Error payloads show the projected document.** A `ValidationError` on a whole object reports the input
@@ -129,6 +181,12 @@ set means the root model.
   costs more than it saves (see the last benchmark row).
 - **Partial instances:** a model with excluded required fields should not also appear inside a union; the
   serializer warns about the missing fields there.
+- **Migrations that build model instances bypass exclusion.** A before validator that does
+  `data["child"] = Child.model_validate(legacy)` hands pydantic a finished instance, and pydantic does not
+  re-validate one, so the edited validator for `Child` never runs and `Child`'s excluded fields keep the
+  values the migration gave them. Only raw dicts pass through the edited validator. Nothing in the library
+  can intercept this, and withholding an adapter does not help -- a nested migration runs inside the
+  kept-whole subtree anyway -- so exclude nothing on the class such a migration builds.
 - The pydantic integration relies on the core-schema layout and on `SchemaValidator(..., _use_prebuilt=False)`,
   which pydantic does not promise to keep. CI tests the latest release and pre-release; a `RuntimeError` is
   raised if pydantic-core ignores the schema edit.
@@ -136,25 +194,36 @@ set means the root model.
 - **Before/wrap/plain validators are not projected through.** Their input is not the shape the schema they
   wrap describes, so a model or field behind one is kept whole and nothing inside it is projected. A root
   model whose own fields sit behind a `model_validator(mode='before')`, `'wrap'` or `'plain'` cannot be
-  projected at all: `Projected` and `projection_spec` raise `TypeError`. Use `projected_validator` alone.
+  projected at all: `Projected` and `projection_spec` raise `TypeError`. Register a projection adapter for
+  the class (see "Migration validators") to project through a before or wrap validator; a plain validator
+  cannot be adapted, so use `projected_validator` alone. An adapter vouches for *exactly the wrappers
+  pydantic emits for the class's own registered model validators* -- `@classmethod`, `@staticmethod` and
+  inherited ones alike -- and for nothing else. A validator installed from outside the class stays opaque
+  even when it is a bound method of the adapted class, and even when it reuses one of the class's own
+  registered validators: an `Annotated[Cls, BeforeValidator(Cls.migrate)]` on somebody's field runs that
+  migration a second time, over a shape the adapter never described. A field validator on the enclosing
+  model is the same story. At the root such a wrapper raises `TypeError` saying so, rather than asking
+  for the adapter you already registered.
 - **After validators and excluded required fields.** A `model_validator(mode='after')` that touches an excluded
   required field raises `AttributeError` from `validate_json`, not a `ValidationError`.
 - **Extras.** A model with `extra='allow'` that has no excluded field of its own is kept whole (nothing below it
-  is projected). A model with `extra='allow'` that does have excluded fields loses all its extras: the
-  projection keeps only declared fields.
+  is projected), and an adapter registered for it is not consulted, so its `requires` are not checked. A
+  model with `extra='allow'` that does have excluded fields loses all its extras: the projection keeps only
+  declared fields.
 - **Standalone `projected_validator`.** Excluded fields with a default are redirected to the alias
   `\x00excluded:<name>`; a document that contains that literal key still populates the field. `Projected`
   strips it. Validating with `by_name=True` or `by_alias=False` on the returned `SchemaValidator` looks
   the field up under its own name again, so a document that carries the excluded key populates the field
   and the default is not applied. `Projected.validate_json` refuses both flags with `ValueError` whenever
   its projection is incomplete, and forwards them when it is not (the projection stripped alias and name
-  alike).
+  alike). Projection adapters do not affect it: it never projects JSON.
 - **Kept-whole subtrees.** The derived projection describes models, lists, sets and variable-length tuples;
   everything else is kept whole -- dict values, unions, fixed tuples, dataclasses, TypedDicts, `Any`, a class
   that appears inside itself, an `extra='allow'` model with no excluded fields of its own, the object named by
   a multi-segment alias path, a JSON key that two fields describe differently. Nothing inside a kept subtree
   is projected, so when an excluded class is reachable in one, `Projected` keeps the standalone guards on for
-  every class in the schema.
+  every class in the schema. Adapters registered for classes inside such a subtree still run, and can still
+  refuse the exclusion set; only the spec they produce is discarded.
 - **RootModel is unsupported** in 0.1: `projection_spec` and `Projected` raise `TypeError`, and
   `projected_validator` reports the excluded names as not found. A `RootModel` declares one field, `root`,
   and the class it wraps is reached through it like any other nested model.
@@ -162,7 +231,9 @@ set means the root model.
   would touch it or anything below it: pydantic-core calls that `__init__`, which validates through the
   class's original validator and ignores the exclusion entirely.
 - **A field aliased `__all__`** cannot be expressed: `__all__` is the array wildcard in a mapping spec, so a
-  derived spec containing it is rejected with `TypeError`.
+  derived spec containing it is rejected with `TypeError`. In a `migration_adapter` path the segment means
+  "keep that container whole", so the path is truncated there; a path that *starts* with `__all__` would ask
+  for the whole root object, which no spec can say, and raises `TypeError` at construction.
 - **Data-dependent defaults and computed fields.** A `default_factory` that takes the validated data raises a
   plain `KeyError` from `validate_json` when it reads an excluded field, and a computed field that reads an
   excluded attribute raises `AttributeError` from `model_dump`. Neither becomes a `ValidationError`.

@@ -1,5 +1,6 @@
 import json
 import math
+from typing import Any
 
 import pytest
 
@@ -93,3 +94,21 @@ def test_matches_reference_on_generated_corpus(seed):
     for raw, spec in corpus(seed, 1500):
         out = project(raw, spec)
         assert _canon(json.loads(out)) == _canon(reference_project(json.loads(raw), spec)), (raw, spec)
+
+
+def test_self_referential_spec_is_rejected():
+    d = {}
+    d["self"] = d
+    with pytest.raises(TypeError, match="nesting"):
+        project(b"{}", d)
+
+
+def test_spec_nesting_is_capped():
+    deep: Any = True
+    for _ in range(1000):
+        deep = {"k": deep}
+    assert project(b'{"k": 1}', deep) == b'{"k": 1}'
+    for _ in range(1000):
+        deep = {"k": deep}
+    with pytest.raises(TypeError, match="nesting"):
+        project(b"{}", deep)

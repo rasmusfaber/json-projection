@@ -15,10 +15,14 @@ pub enum Spec {
     Array(Box<Spec>),
 }
 
+/// Deepest spec nesting accepted. The conversion below and the walk both recurse per level, so the cap
+/// keeps a pathological spec (a self-referential mapping, say) from overflowing the stack.
+const MAX_DEPTH: usize = 1000;
+
 impl Spec {
     /// Compile a root spec: an iterable of `str`, or a mapping. The root always describes an object.
     pub fn from_py_root(obj: &Bound<'_, PyAny>) -> PyResult<Spec> {
-        match Self::from_py(obj, true)? {
+        match Self::from_py(obj, true, 0)? {
             spec @ Spec::Object(_) => Ok(spec),
             _ => Err(PyTypeError::new_err(
                 "the root spec must be a set of keys or a mapping describing an object",
@@ -26,7 +30,12 @@ impl Spec {
         }
     }
 
-    fn from_py(obj: &Bound<'_, PyAny>, root: bool) -> PyResult<Spec> {
+    fn from_py(obj: &Bound<'_, PyAny>, root: bool, depth: usize) -> PyResult<Spec> {
+        if depth > MAX_DEPTH {
+            return Err(PyTypeError::new_err(format!(
+                "spec nesting exceeds {MAX_DEPTH} levels"
+            )));
+        }
         if let Ok(b) = obj.cast::<PyBool>() {
             if b.is_true() && !root {
                 return Ok(Spec::Keep);
@@ -38,7 +47,7 @@ impl Spec {
         if !obj.is_instance_of::<PyDict>() && obj.hasattr("keys")? {
             // any other Mapping (MappingProxyType, custom mappings): compile once through a dict copy
             let as_dict = obj.py().get_type::<PyDict>().call1((obj,))?;
-            return Self::from_py(&as_dict, root);
+            return Self::from_py(&as_dict, root, depth);
         }
         if let Ok(dict) = obj.cast::<PyDict>() {
             if dict.len() == 1 {
@@ -48,7 +57,11 @@ impl Spec {
                             "\"__all__\" is not allowed at the root; the root must be an object",
                         ));
                     }
-                    return Ok(Spec::Array(Box::new(Self::from_py(&inner, false)?)));
+                    return Ok(Spec::Array(Box::new(Self::from_py(
+                        &inner,
+                        false,
+                        depth + 1,
+                    )?)));
                 }
             }
             let mut map = HashMap::with_capacity(dict.len());
@@ -63,7 +76,7 @@ impl Spec {
                         "\"__all__\" cannot be combined with other keys",
                     ));
                 }
-                map.insert(key, Self::from_py(&v, false)?);
+                map.insert(key, Self::from_py(&v, false, depth + 1)?);
             }
             return Ok(Spec::Object(map));
         }
@@ -188,6 +201,27 @@ mod tests {
                 Spec::Object(HashMap::from([("a".to_string(), inner)]))
             );
         });
+    }
+
+    #[test]
+    fn deeper_than_the_cap_is_an_error() {
+        let nest = |n: usize| {
+            format!("__import__('functools').reduce(lambda d,_: {{'k': d}}, range({n}), True)")
+        };
+        // a debug frame is fat and a test thread's default stack is 2 MiB: give the recursion room
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(move || {
+                Python::attach(|py| {
+                    assert!(compile(py, &nest(MAX_DEPTH)).is_ok());
+                    assert!(compile(py, &nest(2000))
+                        .unwrap_err()
+                        .is_instance_of::<PyTypeError>(py));
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

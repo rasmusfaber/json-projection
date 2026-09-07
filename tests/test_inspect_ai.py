@@ -7,6 +7,7 @@ a private inspect_ai module, so it may move without notice.
 Run locally with:  uv run --no-sync --with inspect_ai pytest -q tests/test_inspect_ai.py
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -19,7 +20,7 @@ try:
 except ImportError:  # the read-context helper is private to inspect_ai and may move
     pytest.skip("inspect_ai's deserializing-context helper is unavailable", allow_module_level=True)
 
-from inspect_ai.log import EvalLog, EvalSample  # type: ignore  # noqa: E402
+from inspect_ai.log import EvalLog, EvalSample, EvalSpec  # type: ignore  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
 from inspect_adapters import BULK_FIELDS, INSPECT_ADAPTERS  # type: ignore  # noqa: E402
@@ -53,3 +54,20 @@ def test_a_legacy_log_loads_with_the_bulk_fields_excluded():
 def test_a_current_format_log_round_trips():
     current = EvalLog.model_validate_json(FIXTURE.read_bytes()).model_dump_json().encode()
     _both(current)
+
+
+def test_the_spec_fallback_survives_excluding_task_args():
+    """Excluding `task_args` must not lose `task_args_passed`, which the migration derives from it."""
+    doc = json.loads(FIXTURE.read_bytes())
+    doc["eval"]["task_args"] = {"n": 3, "flag": True}  # the fixture's own task_args is empty
+    raw = json.dumps(doc).encode()
+    exclude = {EvalSample: BULK_FIELDS, EvalSpec: {"task_args"}}
+    plain = EvalLog.model_validate_json(raw, context=get_deserializing_context())
+    thin = Projected(EvalLog, exclude, projection_adapters=INSPECT_ADAPTERS).validate_json(
+        raw, context=get_deserializing_context()
+    )
+    assert plain.eval.task_args_passed == {"n": 3, "flag": True}
+    assert thin.eval.task_args_passed == plain.eval.task_args_passed
+    assert thin.eval.task_args == {}  # excluded: default applied, though the key was kept for the migration
+    norm = normalize_exclude(EvalLog, exclude)
+    assert retained_dump(thin, norm) == retained_dump(plain, norm)

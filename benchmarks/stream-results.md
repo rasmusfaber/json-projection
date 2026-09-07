@@ -8,7 +8,7 @@ Build profile: release (operator-declared, not detected from the extension)
 
 ## Recorded run
 
-Measured on 2026-09-07 with the release extension built from `947cffe` and the harness at `b49aefd`:
+Measured on 2026-09-07 with the release extension built from `947cffe` using Rust 1.91.1 and the harness at `b49aefd`:
 
 ```bash
 uv run maturin develop --uv --release

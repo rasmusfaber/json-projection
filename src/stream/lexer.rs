@@ -397,7 +397,7 @@ mod tests {
     #[test]
     fn numbers_wait_for_delimiters_or_eof() {
         for prefix in ["0", "-0", "1", "-12", "1.5", "1e+2"] {
-            for delimiter in [b' ', b'\t', b'\r', b'\n', b',', b']', b'}', b'x'] {
+            for delimiter in *b" \t\r\n,]}x" {
                 let mut scalar = state_after(prefix.as_bytes());
                 assert_eq!(scalar.finish(), Ok(()));
                 assert_eq!(scalar.push(delimiter), Ok(Advance::Delimiter));

@@ -16,8 +16,11 @@ pub enum Spec {
 }
 
 /// Deepest spec nesting accepted. The conversion below and the walk both recurse per level, so the cap
-/// keeps a pathological spec (a self-referential mapping, say) from overflowing the stack.
-const MAX_DEPTH: usize = 1000;
+/// keeps a pathological spec (a self-referential mapping, say) from overflowing the stack. jiter refuses
+/// documents nested deeper than its own recursion limit of 200 (201 at the edge), so no spec deeper than
+/// that can ever match input; 256 leaves headroom while bounding the walk's worst-case stack to about a
+/// quarter of what 1000 needed.
+const MAX_DEPTH: usize = 256;
 
 impl Spec {
     /// Compile a root spec: an iterable of `str`, or a mapping. The root always describes an object.
@@ -205,23 +208,15 @@ mod tests {
 
     #[test]
     fn deeper_than_the_cap_is_an_error() {
-        let nest = |n: usize| {
-            format!("__import__('functools').reduce(lambda d,_: {{'k': d}}, range({n}), True)")
-        };
-        // a debug frame is fat and a test thread's default stack is 2 MiB: give the recursion room
-        std::thread::Builder::new()
-            .stack_size(64 << 20)
-            .spawn(move || {
-                Python::attach(|py| {
-                    assert!(compile(py, &nest(MAX_DEPTH)).is_ok());
-                    assert!(compile(py, &nest(2000))
-                        .unwrap_err()
-                        .is_instance_of::<PyTypeError>(py));
-                });
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+        Python::attach(|py| {
+            let nest = |n: usize| {
+                format!("__import__('functools').reduce(lambda d,_: {{'k': d}}, range({n}), True)")
+            };
+            assert!(compile(py, &nest(MAX_DEPTH)).is_ok());
+            assert!(compile(py, &nest(2000))
+                .unwrap_err()
+                .is_instance_of::<PyTypeError>(py));
+        });
     }
 
     #[test]

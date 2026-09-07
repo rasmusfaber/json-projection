@@ -122,10 +122,10 @@ def test_self_referential_spec_is_rejected():
 
 def test_spec_nesting_is_capped():
     deep: Any = True
-    for _ in range(1000):
+    for _ in range(256):  # MAX_DEPTH in src/spec.rs
         deep = {"k": deep}
     assert project(b'{"k": 1}', deep) == b'{"k": 1}'
-    for _ in range(1000):
+    for _ in range(2000):
         deep = {"k": deep}
     with pytest.raises(TypeError, match="nesting"):
         project(b"{}", deep)

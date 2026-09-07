@@ -377,3 +377,45 @@ def test_bare_str_exclude_is_a_type_error():
         projected_validator(Log, "debug")
     with pytest.raises(TypeError, match="not a str"):
         Projected(Log, "debug")
+
+
+def test_forbid_root_stays_projected_when_no_excluded_class_is_below_an_allow_model():
+    class Loose(BaseModel):
+        model_config = ConfigDict(extra="allow")
+        a: int
+
+    class Strict(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        nested: Loose
+        secret: dict[str, Any]
+
+    raw = b'{"nested": {"a": 1, "extra_k": 2}, "secret": {"big": 1}}'
+    out = Projected(Strict, {"secret"}).validate_json(raw)
+    assert "secret" not in out.__dict__
+    assert out.nested.a == 1 and out.nested.model_extra == {"extra_k": 2}
+
+
+def test_an_excluded_class_below_an_allow_model_keeps_the_guards():
+    class Deep(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        d: int
+        secret: dict[str, Any]
+
+    class Loose(BaseModel):
+        model_config = ConfigDict(extra="allow")
+        deep: Deep
+
+    class Strict(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        nested: Loose
+        secret: dict[str, Any]
+
+    with pytest.raises(ValueError, match="forbid"):
+        Projected(Strict, {Strict: {"secret"}, Deep: {"secret"}})
+
+    class Plain(BaseModel):  # nothing on the root itself trips a guard: only Deep can
+        nested: Loose
+        junk: dict[str, Any] = {}
+
+    with pytest.raises(ValueError, match="Deep"):
+        Projected(Plain, {Plain: {"junk"}, Deep: {"secret"}})

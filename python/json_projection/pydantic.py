@@ -178,7 +178,8 @@ def _derive_spec(model: type[BaseModel], excluded: dict[type, frozenset[str]]) -
 
     The spec is cut off at a class that appears inside itself (a spec is a finite tree) and at an
     `extra='allow'` class with no excluded fields of its own (its undeclared keys are data). Below such a
-    cut-off the projection keeps whole values and cannot remove excluded keys; `complete` is False then.
+    cut-off the projection keeps whole values, so `complete` is False when an excluded class can still be
+    reached there and the projection would therefore leave its keys in place.
     """
     schema: dict[str, Any] = cast("dict[str, Any]", model.__pydantic_core_schema__)
     definitions: dict[str, dict[str, Any]] = {}
@@ -189,6 +190,25 @@ def _derive_spec(model: type[BaseModel], excluded: dict[type, frozenset[str]]) -
 
     _walk(schema, _record_ref)
     complete = [True]
+
+    def reaches_excluded(node: dict[str, Any]) -> bool:
+        """Whether an excluded class has a `model` node under `node`, following each ref once."""
+        hit = [False]
+        refs: set[str] = set()
+        pending = [node]
+
+        def look(n: dict[str, Any]) -> None:
+            if n.get("type") == "model" and excluded.get(n["cls"]):
+                hit[0] = True
+            ref = n.get("schema_ref")
+            if isinstance(ref, str) and ref not in refs:
+                refs.add(ref)
+                if ref in definitions:
+                    pending.append(definitions[ref])
+
+        while pending and not hit[0]:
+            _walk(pending.pop(), look)
+        return hit[0]
 
     def spec_for(node: dict[str, Any], seen: frozenset[type]) -> Any:
         t = node.get("type")
@@ -222,9 +242,10 @@ def _derive_spec(model: type[BaseModel], excluded: dict[type, frozenset[str]]) -
                 complete[0] = False
                 return True
             if _extra(cls) == "allow" and not excluded.get(cls):
-                # undeclared keys are data on this class, so keep the whole object. An excluded class
-                # may sit below it, whose keys the projection then cannot remove: a cut-off like recursion.
-                complete[0] = False
+                # undeclared keys are data on this class, so keep the whole object. Only an excluded class
+                # below it loses out, its keys surviving the projection: a cut-off like recursion.
+                if reaches_excluded(node):
+                    complete[0] = False
                 return True
             fields = _fields_node(node)
             if fields is None:
@@ -264,9 +285,9 @@ class Projected:
     from the model's core schema minus the excluded fields. Results are instances of the original classes.
 
     The projection stops at a model that appears inside itself and at an `extra='allow'` model with no
-    excluded fields of its own (whose undeclared keys are data), so excluded keys below such a cut-off
-    still reach the validator; every excluded class must then use `extra='ignore'`, and an excluded field
-    with a default must not be populated by name. `projected_validator` raises `ValueError` otherwise.
+    excluded fields of its own (whose undeclared keys are data). An excluded class below such a cut-off
+    still sees its keys, so it must use `extra='ignore'`, and an excluded field with a default must not be
+    populated by name; `projected_validator` raises `ValueError` otherwise.
     """
 
     def __init__(self, model: type[BaseModel], exclude: Exclude) -> None:

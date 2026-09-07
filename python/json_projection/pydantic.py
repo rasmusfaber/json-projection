@@ -444,7 +444,9 @@ def _materialise(cls: type, value: Any, depth: int, seen: frozenset[int]) -> Any
                 )
             out[key] = _materialise(cls, source[key], depth + 1, inner)
         return out
-    return [_materialise(cls, item, depth + 1, inner) for item in value]
+    # the compiler reads a non-mapping iterable as a flat list of leaf keys, so its members sit at this
+    # level, not one below it: only a mapping's values go deeper
+    return [_materialise(cls, item, depth, inner) for item in value]
 
 
 def _adapter_spec(cls: type, result: Any) -> dict[str, Any]:

@@ -768,3 +768,32 @@ def test_the_deepest_output_the_compiler_accepts_still_compiles():
     at_limit = {"children": _nest(255)}  # the root mapping plus 255 more levels
     thin = Projected(KidHolder, {"junk"}, projection_adapters={KidHolder: lambda ctx: at_limit})
     assert thin.spec(KID_DOC).startswith(b'{"children"')  # materialised and compiled, both times
+
+
+def _nest_under(levels: int, leaf: Any) -> Any:
+    spec: Any = leaf
+    for _ in range(levels):
+        spec = {"k": spec}
+    return spec
+
+
+@pytest.mark.parametrize(
+    ("leaf", "limit"),
+    [(["x"], 256), ({"__all__": ["x"]}, 255)],
+    ids=["key-list-leaf", "all-of-key-list-leaf"],
+)
+def test_the_depth_bound_agrees_with_the_compiler(leaf: Any, limit: int):
+    """A non-mapping iterable is a flat list of leaf keys to the compiler, not another level."""
+
+    def accepts(spec: Any) -> bool:
+        Projected(KidHolder, {"junk"}, projection_adapters={KidHolder: lambda ctx: spec})
+        return True
+
+    at_limit = _nest_under(limit, leaf)
+    assert Projection(at_limit) is not None and accepts(at_limit)
+
+    over = _nest_under(limit + 1, leaf)
+    with pytest.raises(TypeError, match="nesting exceeds 256 levels"):
+        Projection(over)  # the compiler refuses it, so the adapter path must too
+    with pytest.raises(TypeError, match="projection adapter for KidHolder.*nesting exceeds 256 levels"):
+        accepts(over)

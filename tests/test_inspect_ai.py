@@ -1,5 +1,9 @@
 """Round-trip real inspect_ai logs through the example adapters. Skipped unless inspect_ai is installed.
 
+inspect_ai regenerates `EvalSpec.eval_id` and message ids on every parse unless a "deserializing" context
+is passed, so both parses below use it to get a meaningful diff instead of always-fresh ids; it comes from
+a private inspect_ai module, so it may move without notice.
+
 Run locally with:  uv run --no-sync --with inspect_ai pytest -q tests/test_inspect_ai.py
 """
 
@@ -10,7 +14,11 @@ import pytest
 
 pytest.importorskip("inspect_ai")
 
-from inspect_ai._util.constants import get_deserializing_context  # type: ignore  # noqa: E402
+try:
+    from inspect_ai._util.constants import get_deserializing_context  # type: ignore  # noqa: E402
+except ImportError:  # the read-context helper is private to inspect_ai and may move
+    pytest.skip("inspect_ai's deserializing-context helper is unavailable", allow_module_level=True)
+
 from inspect_ai.log import EvalLog, EvalSample  # type: ignore  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))

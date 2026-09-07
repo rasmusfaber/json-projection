@@ -158,8 +158,10 @@ pure. A bare string where a collection of paths or names is expected -- `inputs=
 validators themselves still perform the migration; the projection only makes sure they see what they need.
 
 Adapters are looked up by **exact class**: a subclass needs its own entry, and registering one for a class
-that does not appear in the root model's schema raises `ValueError` rather than going silently unused. The
-same adapter object can of course be registered under several classes.
+that does not appear in the root model's schema raises `ValueError` naming the offending classes rather
+than going silently unused -- so a registry shared across roots has to be filtered when you root at a
+subtree class: `{c: a for c, a in REGISTRY.items() if c in {Sample, ...}}`. The same adapter object can of
+course be registered under several classes.
 
 Adapted classes keep the config guards on (see "Refused configurations") because a migration can recreate
 an excluded key from the inputs it was given. `examples/inspect_adapters.py` holds adapters for inspect_ai's
@@ -202,8 +204,9 @@ an excluded key from the inputs it was given. `examples/inspect_adapters.py` hol
 - **After validators and excluded required fields.** A `model_validator(mode='after')` that touches an excluded
   required field raises `AttributeError` from `validate_json`, not a `ValidationError`.
 - **Extras.** A model with `extra='allow'` that has no excluded field of its own is kept whole (nothing below it
-  is projected). A model with `extra='allow'` that does have excluded fields loses all its extras: the
-  projection keeps only declared fields.
+  is projected), and an adapter registered for it is not consulted, so its `requires` are not checked. A
+  model with `extra='allow'` that does have excluded fields loses all its extras: the projection keeps only
+  declared fields.
 - **Standalone `projected_validator`.** Excluded fields with a default are redirected to the alias
   `\x00excluded:<name>`; a document that contains that literal key still populates the field. `Projected`
   strips it. Validating with `by_name=True` or `by_alias=False` on the returned `SchemaValidator` looks

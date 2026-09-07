@@ -13,6 +13,9 @@
   `@staticmethod` and inherited ones alike), not merely bound to it.
 - `Projected.complete` is a read-only property: a conservative proof that the projection removes every
   excluded key everywhere, which is what permits dropping the standalone config guards.
+- `projection_adapters` must name only classes that appear in the root model's schema; anything else is a
+  `ValueError` naming the offending classes, so a shared registry has to be filtered when rooting at a
+  subtree class: `{c: a for c, a in REGISTRY.items() if c in {EvalSample, ...}}`.
 - `examples/inspect_adapters.py`: adapters for inspect_ai's `EvalLog`.
 
 ## 0.1.0 (2026-09-07)

@@ -287,6 +287,8 @@ round-trip in `tests/test_inspect_ai.py`; `tests/test_pydantic.py` is unchanged.
 - Exclusion filtering after before-validators run and before field validation, which would let adapted
   classes drop the guards; and a contract for wrap validators that assign excluded attributes after their
   handler returns.
+- Adapters on `extra='allow'` classes. A model with `extra='allow'` and no excluded fields of its own is
+  kept whole, and an adapter registered for it is not consulted, so its `requires` are not checked.
 - Adapter-declared completeness.
 - A "keep undeclared keys" spec mode in Rust, which a generic adapter could use for models whose
   migrations are unknown.

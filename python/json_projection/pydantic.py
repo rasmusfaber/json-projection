@@ -395,14 +395,33 @@ class in the schema; must be a pure function of its context.
 """
 
 
+def _materialise(cls: type, value: Any) -> Any:
+    """A spec with every lazy iterable in it spent, exactly once.
+
+    An adapter's output is compiled twice -- once here to validate it, once with the rest of the
+    projection -- so a generator or iterator left inside would come back empty the second time and its
+    keys would be dropped from the bytes without a word.
+    """
+    if isinstance(value, Mapping):
+        if not all(isinstance(k, str) for k in value):
+            raise TypeError(
+                f"projection adapter for {cls.__qualname__} returned a mapping with non-str keys, "
+                "expected a mapping of JSON keys to specs"
+            )
+        return {k: _materialise(cls, v) for k, v in cast("Mapping[str, Any]", value).items()}
+    if isinstance(value, (bool, str)) or not isinstance(value, Iterable):
+        return value  # a `str` is iterable but is a leaf here; the compile rejects it where invalid
+    return [_materialise(cls, item) for item in value]
+
+
 def _adapter_spec(cls: type, result: Any) -> dict[str, Any]:
     """An adapter's return value as a spec, or `TypeError` naming the class."""
-    if not isinstance(result, Mapping) or not all(isinstance(k, str) for k in result):
+    if not isinstance(result, Mapping):
         raise TypeError(
             f"projection adapter for {cls.__qualname__} returned {type(result).__name__}, "
             "expected a mapping of JSON keys to specs"
         )
-    spec = dict(cast("Mapping[str, Any]", result))
+    spec = cast("dict[str, Any]", _materialise(cls, result))
     try:
         Projection(spec)  # compile now, so a grammar error names the class instead of surfacing later
     except TypeError as e:

@@ -666,3 +666,45 @@ def test_an_own_wrap_validator_counts_through_nullable_and_definition_ref():
         projection_adapters={Wrapped: migration_adapter(controls=["ctl"])},
     )
     assert spec == {"a": {"x": True, "ctl": True}, "b": {"x": True, "ctl": True}}
+
+
+class Kid(BaseModel):
+    x: int = 0
+    blob: dict[str, Any] = {}
+
+
+class KidHolder(BaseModel):
+    children: list[Kid] = []
+    junk: dict[str, Any] = {}
+
+
+LAZY_SPECS: dict[str, Any] = {
+    "iterator": {"children": {"__all__": iter(["x"])}},
+    "generator": {"children": {"__all__": (k for k in ["x"])}},
+    "tuple": {"children": {"__all__": ("x",)}},
+    "nested-mapping": {"children": {"__all__": {"x": True}}},
+}
+KID_DOC = b'{"children": [{"x": 7, "blob": {"b": 1}}], "junk": {"j": 1}}'
+
+
+@pytest.mark.parametrize("shape", list(LAZY_SPECS), ids=list(LAZY_SPECS))
+def test_a_lazy_adapter_output_survives_being_compiled_twice(shape: str):
+    """The output is compiled once to validate it and once with the projection: spending it twice lost
+    the keys.
+    """
+    thin = Projected(KidHolder, {"junk"}, projection_adapters={KidHolder: lambda ctx: LAZY_SPECS[shape]})
+    assert thin.spec(KID_DOC) == b'{"children": [{"x": 7}]}'
+    assert thin.validate_json(KID_DOC).children[0].x == 7
+
+
+def test_a_generator_returned_by_an_adapter_is_consumed_once():
+    consumed = []
+
+    def once() -> Any:
+        consumed.append(1)
+        yield "x"
+
+    Projected(
+        KidHolder, {"junk"}, projection_adapters={KidHolder: lambda ctx: {"children": {"__all__": once()}}}
+    )
+    assert consumed == [1]

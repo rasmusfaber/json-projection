@@ -162,8 +162,11 @@ opaque fallback:
    recursively and may have their own adapters), then call the adapter with
    `AdapterContext(cls, retained_names, derived_spec)`.
 5. The result must be a `Mapping` with `str` keys, otherwise `TypeError` naming the class and the type
-   returned. It is compiled once with `Projection(result)` to validate the grammar; a compile error is
-   re-raised as `TypeError` prefixed with the class name.
+   returned. It is materialised deeply first -- mappings become dicts (`str` keys checked at every
+   level), `bool` and `str` stay, any other iterable becomes a list of materialised items -- because it
+   is compiled twice, once with `Projection(result)` to validate the grammar and once with the rest of
+   the projection, and a generator or iterator left inside would come back empty the second time. A
+   compile error is re-raised as `TypeError` prefixed with the class name.
 6. The result replaces the derived spec for this object. Keys the adapter added are kept as it said; keys it
    removed are dropped; the excluded fields remain absent unless an input path or control re-adds their key.
 7. Completeness: the class marks the derivation incomplete when it has excluded fields of its own or when

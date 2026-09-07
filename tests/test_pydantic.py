@@ -1,10 +1,12 @@
 import math
-from typing import Any
+from typing import Any, Generic, TypeVar
 
+import pydantic
 import pytest
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field
 
-from json_projection.pydantic import projected_validator
+from json_projection import project
+from json_projection.pydantic import Projected, projected_validator, projection_spec
 
 
 class Event(BaseModel):
@@ -132,3 +134,106 @@ def test_assume_projected_skips_the_guards():
 
     v = projected_validator(Strict, {"b"}, assume_projected=True)
     assert "b" not in v.validate_json(b'{"a": 1}').__dict__  # input already projected: no excluded key present
+
+
+def test_projection_spec_derives_keys_aliases_and_all():
+    spec = projection_spec(Log, {Log: {"debug"}, Sample: {"events"}})
+    assert spec == {
+        "name": True,
+        "samples": {"__all__": {"id": True, "score": True}},
+        "createdBy": True,
+        "created_by": True,
+    }
+
+
+def test_projection_spec_alias_choices_and_path_are_conservative():
+    class A(BaseModel):
+        x: int = Field(validation_alias=AliasChoices("X", "x_alt"))
+        y: int = Field(validation_alias=AliasPath("outer", "inner"))
+        z: list[int] = []
+
+    spec = projection_spec(A, {A: {"z"}})
+    assert spec == {"X": True, "x_alt": True, "x": True, "outer": True, "y": True}
+
+
+def test_projection_spec_recursion_and_unknown_shapes_fall_back_to_true():
+    class Node(BaseModel):
+        v: int
+        children: list["Node"] = []
+        extra: dict[str, Any] = {}
+        anything: Any = None
+
+    Node.model_rebuild()
+    spec = projection_spec(Node, {Node: {"extra"}})
+    assert spec == {"v": True, "children": {"__all__": True}, "anything": True}
+
+
+def test_projected_end_to_end():
+    thin = Projected(Log, {Log: {"debug"}, Sample: {"events"}})
+    log = thin.validate_json(RAW)
+    assert type(log) is Log and len(log.samples) == 2 and log.debug == {}
+    assert "events" not in log.samples[0].__dict__
+    # the derived Projection is reusable on its own and equals a one-shot projection with the same spec
+    assert thin.spec(RAW) == project(RAW, projection_spec(Log, thin.exclude))
+    assert thin.validate_json(RAW.decode()).name == "run"
+
+
+def test_projection_spec_variadic_tuple_uses_all():
+    class T(BaseModel):
+        tags: tuple[str, ...]
+        fixed: tuple[int, str]
+        junk: dict[str, Any] = {}
+
+    assert projection_spec(T, {T: {"junk"}}) == {"tags": {"__all__": True}, "fixed": True}
+
+
+def test_projected_forwards_kwargs_and_errors_match_pydantic():
+    thin = Projected(Log, {Sample: {"events"}})
+    with pytest.raises(pydantic.ValidationError) as ours:
+        thin.validate_json(b'{"name": 1, "createdBy": "r", "samples": []}', strict=True)
+    with pytest.raises(pydantic.ValidationError) as theirs:
+        Log.model_validate_json(b'{"name": 1, "createdBy": "r", "samples": []}', strict=True)
+    assert ours.value.errors()[0]["type"] == theirs.value.errors()[0]["type"] == "string_type"
+    bad = b'{"name":"x","createdBy":"y","samples":[],"junk":[1,2,}'
+    with pytest.raises(pydantic.ValidationError) as ours:
+        thin.validate_json(bad)
+    with pytest.raises(pydantic.ValidationError) as theirs:
+        Log.model_validate_json(bad)
+    assert ours.value.errors()[0]["msg"] == theirs.value.errors()[0]["msg"]
+
+
+def test_generic_model():
+    T = TypeVar("T")
+
+    class Box(BaseModel, Generic[T]):
+        item: T
+        meta: dict[str, Any] = {}
+
+    thin = Projected(Box[int], {Box[int]: {"meta"}})
+    assert thin.validate_json(b'{"item": 1, "meta": {"z": 1}}').meta == {}
+
+
+def test_projected_handles_configs_the_standalone_validator_refuses():
+    class Strict(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        a: int
+        b: list[int]
+
+    class Loose(BaseModel):
+        model_config = ConfigDict(extra="allow")
+        a: int
+        b: list[int]
+        c: dict[str, Any] = {}
+
+    class ByName(BaseModel):
+        model_config = ConfigDict(populate_by_name=True)
+        a: int = Field(validation_alias="A")
+        debug: dict[str, Any] = {}
+
+    raw = b'{"a": 1, "A": 1, "b": [1, 2], "c": {"x": 1}, "debug": {"leak": 1}, "other": 5}'
+    s = Projected(Strict, {"b"}).validate_json(b'{"a": 1, "b": [1, 2]}')
+    assert s.a == 1 and "b" not in s.__dict__
+    lo = Projected(Loose, {"b", "c"}).validate_json(raw)
+    assert lo.a == 1 and "b" not in lo.__dict__ and lo.c == {} and not lo.model_extra
+    bn = Projected(ByName, {"debug"}).validate_json(raw)
+    assert bn.a == 1 and bn.debug == {}

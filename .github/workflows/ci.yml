@@ -44,8 +44,10 @@ jobs:
           python-version: ${{ matrix.python }}
       # uv sync builds and installs the extension through maturin (release profile); no separate develop step
       - run: uv sync --group dev --python ${{ matrix.python }}
-      # override the locked pydantic; every later command uses --no-sync so uv does not restore the lock
-      - run: uv pip install ${{ matrix.pydantic }}
+      # override the locked pydantic; every later command uses --no-sync so uv does not restore the lock.
+      # --upgrade is required: without it uv leaves the locked release in place, since it already
+      # satisfies both "pydantic" and "pydantic>2.13", and the latest/pre-release cells retest the lock
+      - run: uv pip install --upgrade ${{ matrix.pydantic }}
         shell: bash
       - run: uv run --no-sync python -c "import pydantic, pydantic_core; print(pydantic.VERSION, pydantic_core.__version__)"
       - run: uv run --no-sync ruff check . && uv run --no-sync ruff format --check .

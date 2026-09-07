@@ -1,7 +1,8 @@
 # json-projection: design
 
 Date: 2026-09-07
-Status: approved in discussion, awaiting written review
+Status: approved in discussion; amended 2026-09-07 after two written reviews (the depth bullet
+under Semantics and the projection-derivation notes below now describe the shipped behaviour).
 
 ## Problem
 
@@ -81,11 +82,13 @@ specs and JSONPath are out of scope for 0.1.
 - Dropped members are skipped with jiter's `known_skip`. Escapes, control
   characters, number syntax and nesting are still validated; UTF-8 inside
   dropped strings is not.
-- Nesting depth inside a dropped or kept member gets jiter's fresh budget of
-  200 while pydantic counts the root object too, so a document whose total
-  depth is exactly 201 (202 when the innermost container is empty) is accepted
-  where pydantic alone rejects it. Deeper input is rejected by both; shallower
-  input is accepted by both.
+- Nesting depth is not accounted globally. Every dropped or kept member starts
+  a fresh jiter budget of 200 below the member that holds it, and the
+  containers the projector itself descends through cost nothing, so a document
+  is accepted at any total depth as long as no single member is nested deeper
+  than 200 below its parent. Documents pydantic alone rejects for exceeding
+  its recursion limit therefore go through. The output is still bounded by
+  pydantic's own parse, which counts every level it is given.
 - On any JSON syntax error, or when the root is not an object, `project`
   returns the input bytes unchanged so the downstream parser reports the
   identical error. With `strict=True` it raises `ValueError` instead.
@@ -162,10 +165,16 @@ thin.validator  # pydantic_core.SchemaValidator
   `extra_forbidden` error).
 - `projection_spec(model, exclude)`: derives the keep-spec from the same
   schema. `model` -> mapping of kept fields; list, set, frozenset and
-  variable tuple -> `{"__all__": ...}`; `nullable`, `default` and function
-  wrappers are looked through; `definition-ref` is resolved; a string
+  variable tuple -> `{"__all__": ...}`; `nullable`, `default` and
+  `function-after` wrappers are looked through, while `function-before`,
+  `function-wrap` and `function-plain` are opaque (their input is not the shape
+  the schema they wrap describes); `definition-ref` is resolved; a string
   `validation_alias` or `AliasChoices` becomes the JSON key(s); anything else
-  (dict, union, Any, recursion) becomes `True`, which is always safe.
+  (dict, union, fixed tuple, dataclass, TypedDict, Any, recursion) becomes
+  `True`, which keeps the value and is always safe to validate. Every such
+  fallback records whether an excluded class was reachable in the subtree it
+  kept, and that is what decides whether `Projected` may drop the standalone
+  guards.
 - `Projected` composes the two and exposes `validate_json(data, **kwargs)`
   forwarding `strict`, `context`, `by_alias`, `by_name`.
 

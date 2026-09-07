@@ -55,7 +55,10 @@ set means the root model.
 - **Error payloads show the projected document.** A `ValidationError` on a whole object reports the input
   without the dropped members.
 - **UTF-8 inside dropped data is not validated.** Escapes, control characters, numbers and nesting still are.
-- **Nesting depth:** a document exactly 201 levels deep is accepted where pydantic alone rejects it.
+- **Nesting depth is not accounted globally.** Every dropped or kept member starts a fresh nesting budget
+  of 200 below the member that holds it, and the containers the projector descends through cost nothing,
+  so a document can be accepted at any total depth where pydantic alone rejects it for exceeding its
+  recursion limit. What comes out is still bounded by pydantic's own parse of the kept members.
 - **Kept data is copied once.** When little can be dropped, or a huge string sits under a dropped key, the copy
   costs more than it saves (see the last benchmark row).
 - **Partial instances:** a model with excluded required fields should not also appear inside a union; the
@@ -63,10 +66,11 @@ set means the root model.
 - The pydantic integration relies on the core-schema layout and on `SchemaValidator(..., _use_prebuilt=False)`,
   which pydantic does not promise to keep. CI tests the latest release and pre-release; a `RuntimeError` is
   raised if pydantic-core ignores the schema edit.
-- **Refused configurations.** `projected_validator` on its own refuses, with `ValueError`, models whose config would still consume an excluded key: `extra='forbid'` or `extra='allow'`, and `populate_by_name`/`validate_by_name` when an excluded field has a default. `Projected` lifts that restriction because its byte projection removes the key first, except for recursive models where the derived spec cannot reach every occurrence; those stay refused.
-- **Before/wrap model validators.** A `model_validator(mode='before')` or `mode='wrap'` that reads keys the
-  model does not declare will not see them: the projection keeps only declared fields. Exclude nothing on such
-  a model or use `projected_validator` alone.
+- **Refused configurations.** `projected_validator` on its own refuses, with `ValueError`, models whose config would still consume an excluded key: `extra='forbid'` or `extra='allow'`, and `populate_by_name`/`validate_by_name` when an excluded field has a default. `Projected` lifts that restriction only when its derived projection provably reaches every occurrence of every excluded class; where it cannot (see "Kept-whole subtrees"), the guards stay on.
+- **Before/wrap/plain validators are not projected through.** Their input is not the shape the schema they
+  wrap describes, so a model or field behind one is kept whole and nothing inside it is projected. A root
+  model whose own fields sit behind a `model_validator(mode='before')`, `'wrap'` or `'plain'` cannot be
+  projected at all: `Projected` and `projection_spec` raise `TypeError`. Use `projected_validator` alone.
 - **After validators and excluded required fields.** A `model_validator(mode='after')` that touches an excluded
   required field raises `AttributeError` from `validate_json`, not a `ValidationError`.
 - **Extras.** A model with `extra='allow'` that has no excluded field of its own is kept whole (nothing below it
@@ -75,9 +79,23 @@ set means the root model.
 - **Standalone `projected_validator`.** Excluded fields with a default are redirected to the alias
   `\x00excluded:<name>`; a document that contains that literal key still populates the field. `Projected`
   strips it.
-- **Recursion.** When any model in the schema recurses, the derived projection stops at the first repetition and
-  `Projected` keeps the standalone guards on for every class in the schema, so a non-recursive `extra='forbid'`
-  root is refused if an unrelated recursive class is nested under it.
+- **Kept-whole subtrees.** The derived projection describes models, lists, sets and variable-length tuples;
+  everything else is kept whole -- dict values, unions, fixed tuples, dataclasses, TypedDicts, `Any`, a class
+  that appears inside itself, an `extra='allow'` model with no excluded fields of its own, the object named by
+  a multi-segment alias path, a JSON key that two fields describe differently. Nothing inside a kept subtree
+  is projected, so when an excluded class is reachable in one, `Projected` keeps the standalone guards on for
+  every class in the schema.
+- **RootModel is unsupported** in 0.1: `projection_spec` and `Projected` raise `TypeError`, and
+  `projected_validator` reports the excluded names as not found. A `RootModel` declares one field, `root`,
+  and the class it wraps is reached through it like any other nested model.
+- **Custom `__init__`.** A model that defines its own `__init__` is refused with `ValueError` when exclusion
+  would touch it or anything below it: pydantic-core calls that `__init__`, which validates through the
+  class's original validator and ignores the exclusion entirely.
+- **A field aliased `__all__`** cannot be expressed: `__all__` is the array wildcard in a mapping spec, so a
+  derived spec containing it is rejected with `TypeError`.
+- **Data-dependent defaults and computed fields.** A `default_factory` that takes the validated data raises a
+  plain `KeyError` from `validate_json` when it reads an excluded field, and a computed field that reads an
+  excluded attribute raises `AttributeError` from `model_dump`. Neither becomes a `ValidationError`.
 
 ## Errors
 

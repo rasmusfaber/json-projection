@@ -352,6 +352,84 @@ def _adapter_spec(cls: type, result: Any) -> dict[str, Any]:
     return spec
 
 
+KeyPath = Union[str, tuple[str, ...]]  # noqa: UP007  (runtime alias must work on 3.9)
+"""One JSON key, or a nested key path, as given to `migration_adapter`."""
+
+
+def _key_path(path: KeyPath) -> tuple[str, ...]:
+    if isinstance(path, str):
+        return (path,)
+    if isinstance(path, tuple) and path and all(isinstance(seg, str) for seg in path):
+        return path
+    raise TypeError(f"a path is a JSON key or a tuple of keys, not {path!r}")
+
+
+def _keep_path(spec: dict[str, Any], path: tuple[str, ...]) -> None:
+    """Merge `path` into `spec` as a kept path.
+
+    Every conflict widens to `True`: keeping more is always safe.
+    """
+    node = spec
+    for seg in path[:-1]:
+        child = node.get(seg)
+        if child is True:
+            return  # already kept whole
+        if child is None:
+            child = node[seg] = {}
+        elif not isinstance(child, dict) or "__all__" in child:
+            node[seg] = True  # an array spec (or anything else) where the path expects an object
+            return
+        node = child
+    node[path[-1]] = True
+
+
+def migration_adapter(
+    *,
+    inputs: Mapping[str, Iterable[KeyPath]] | None = None,
+    controls: Iterable[KeyPath] = (),
+    requires: Mapping[str, Iterable[str]] | None = None,
+) -> ProjectionAdapter:
+    """An adapter built from what a class's migrations read.
+
+    `inputs`: retained field -> JSON paths a migration may read to produce it (legacy locations and
+    fallbacks alike); merged into the derived spec only when that field is retained. `controls`: paths kept
+    whenever present, regardless of exclusions -- keys a validator dispatches on or checks for mutual
+    exclusion. `requires`: retained field -> retained fields it depends on; a dependency that is excluded
+    is a `ValueError` at construction of the projection. Field names that the class does not declare are
+    a `ValueError` too.
+    """
+    input_paths = {field: [_key_path(p) for p in paths] for field, paths in (inputs or {}).items()}
+    control_paths = [_key_path(p) for p in controls]
+    dependencies = {field: list(deps) for field, deps in (requires or {}).items()}
+
+    def adapter(ctx: AdapterContext) -> dict[str, Any]:
+        declared = set(ctx.model.model_fields)
+        named = set(input_paths) | set(dependencies) | {d for deps in dependencies.values() for d in deps}
+        unknown = sorted(named - declared)
+        if unknown:
+            raise ValueError(
+                f"{ctx.model.__qualname__}: migration_adapter names fields the class does not declare: "
+                f"{unknown}"
+            )
+        for field, deps in dependencies.items():
+            if field in ctx.fields:
+                for dep in deps:
+                    if dep not in ctx.fields:
+                        raise ValueError(
+                            f"{ctx.model.__qualname__}: retaining {field!r} requires {dep!r}, "
+                            f"which is excluded"
+                        )
+        for field, paths in input_paths.items():
+            if field in ctx.fields:
+                for path in paths:
+                    _keep_path(ctx.spec, path)
+        for path in control_paths:
+            _keep_path(ctx.spec, path)
+        return ctx.spec
+
+    return adapter
+
+
 def _derive_spec(
     model: type[BaseModel],
     excluded: dict[type, frozenset[str]],

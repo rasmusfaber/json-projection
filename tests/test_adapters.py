@@ -1,16 +1,14 @@
 """Projection adapters: projecting through models with migration (before/wrap) validators."""
 
+import json
 from typing import Any
 
 import pytest
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
-from json_projection.pydantic import AdapterContext, Projected, projection_spec
-
-
-class Item(BaseModel):
-    id: int
-    blob: dict[str, Any] = {}
+from json_projection.pydantic import AdapterContext, Projected, _keep_path, migration_adapter, projection_spec
+from migration_models import ADAPTERS as MIGRATION_ADAPTERS
+from migration_models import Item, Log, Sample
 
 
 class Legacy(BaseModel):
@@ -156,3 +154,79 @@ def test_a_field_validator_on_an_adapted_class_stays_opaque():
     got = thin.validate_json(doc)
     assert (got.legacy.name, got.legacy.payload, got.junk) == ("n", {}, {})
     assert b"inner" in thin.spec(doc) and b"payload" in thin.spec(doc)
+
+
+def test_inputs_are_kept_only_for_retained_fields():
+    spec = projection_spec(Sample, {"events", "timelines"}, projection_adapters=MIGRATION_ADAPTERS)
+    assert spec["score"] is True and spec["transcript"] == {"content": True}
+    assert "events" not in spec and "timelines" not in spec
+    spec = projection_spec(
+        Sample, {"events", "timelines", "attachments"}, projection_adapters=MIGRATION_ADAPTERS
+    )
+    assert "transcript" not in spec and spec["score"] is True
+    spec = projection_spec(Sample, {"scores"}, projection_adapters=MIGRATION_ADAPTERS)
+    assert "score" not in spec and spec["transcript"] == {"events": True, "content": True}
+
+
+def test_controls_are_kept_even_when_excluded():
+    spec = projection_spec(Log, {"version"}, projection_adapters=MIGRATION_ADAPTERS)
+    assert spec["version"] is True and "title" in spec  # name is retained, so its legacy input is too
+    assert "title" not in projection_spec(Log, {"name"}, projection_adapters=MIGRATION_ADAPTERS)
+
+
+@pytest.mark.parametrize(
+    ("spec", "path", "expected"),
+    [
+        ({}, ("a", "b"), {"a": {"b": True}}),
+        ({"a": True}, ("a", "b"), {"a": True}),
+        ({"a": {"x": True}}, ("a", "b"), {"a": {"x": True, "b": True}}),
+        ({"a": {"__all__": {"x": True}}}, ("a", "b"), {"a": True}),
+        ({"a": {"x": True}}, ("a",), {"a": True}),
+    ],
+    ids=["create", "already-whole", "descend", "array-meets-object-widens", "leaf-onto-mapping-widens"],
+)
+def test_keep_path_merging(spec: dict[str, Any], path: tuple[str, ...], expected: dict[str, Any]):
+    _keep_path(spec, path)
+    assert spec == expected
+
+
+def test_migration_adapter_rejects_unknown_field_names():
+    bad = migration_adapter(inputs={"scroes": ["score"]})
+    with pytest.raises(ValueError, match="does not declare.*scroes"):
+        projection_spec(Sample, set(), projection_adapters={Sample: bad})
+    bad = migration_adapter(requires={"timelines": ["evnets"]})
+    with pytest.raises(ValueError, match="does not declare.*evnets"):
+        projection_spec(Sample, set(), projection_adapters={Sample: bad})
+
+
+def test_migration_adapter_rejects_bad_paths():
+    with pytest.raises(TypeError, match="a path is a JSON key or a tuple of keys"):
+        migration_adapter(inputs={"scores": [1]})  # type: ignore[list-item]
+
+
+def test_a_dependency_on_an_excluded_field_is_a_conflict():
+    with pytest.raises(ValueError, match="retaining 'timelines' requires 'events', which is excluded"):
+        Projected(Sample, {"events"}, projection_adapters=MIGRATION_ADAPTERS)
+    Projected(Sample, {"events", "timelines"}, projection_adapters=MIGRATION_ADAPTERS)  # both gone: fine
+
+
+def test_an_emptied_legacy_object_keeps_its_presence():
+    thin = Projected(Sample, {"events", "timelines"}, projection_adapters=MIGRATION_ADAPTERS)
+    doc = b'{"id": 1, "transcript": {"events": [{"id": 9, "blob": {}}]}, "attachments": {"stale": "x"}}'
+    assert json.loads(thin.spec(doc)) == {"id": 1, "transcript": {}, "attachments": {"stale": "x"}}
+    # the (now empty) transcript still overwrites attachments, exactly as in plain validation
+    assert thin.validate_json(doc).attachments == Sample.model_validate_json(doc).attachments == {}
+
+
+def test_legacy_inputs_reach_the_migration():
+    thin = Projected(Sample, {"store"}, projection_adapters=MIGRATION_ADAPTERS)
+    doc = (
+        b'{"id": 1, "score": 0.5, "store": {"big": [1, 2, 3]},'
+        b' "timelines": [{"name": "t", "event_ids": [9]}],'
+        b' "transcript": {"events": [{"id": 9, "blob": {"b": 1}}], "content": {"k": "v"}}}'
+    )
+    plain = Sample.model_validate_json(doc)
+    got = thin.validate_json(doc)
+    assert got.scores == plain.scores == {"legacy": 0.5}
+    assert got.events == plain.events and got.attachments == plain.attachments == {"k": "v"}
+    assert got.timelines == plain.timelines and got.store == {}

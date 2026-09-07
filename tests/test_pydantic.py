@@ -237,3 +237,39 @@ def test_projected_handles_configs_the_standalone_validator_refuses():
     assert lo.a == 1 and "b" not in lo.__dict__ and lo.c == {} and not lo.model_extra
     bn = Projected(ByName, {"debug"}).validate_json(raw)
     assert bn.a == 1 and bn.debug == {}
+
+
+def test_projected_recursive_models_keep_the_guards():
+    class StrictNode(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        v: int
+        children: list["StrictNode"] = []
+        secret: dict[str, Any]
+
+    class LooseNode(BaseModel):
+        model_config = ConfigDict(extra="allow")
+        v: int
+        children: list["LooseNode"] = []
+        secret: dict[str, Any]
+
+    StrictNode.model_rebuild()
+    LooseNode.model_rebuild()
+    with pytest.raises(ValueError, match="forbid"):
+        Projected(StrictNode, {StrictNode: {"secret"}})
+    with pytest.raises(ValueError, match="allow"):
+        Projected(LooseNode, {LooseNode: {"secret"}})
+
+
+def test_projected_recursive_ignore_model_excludes_at_every_depth():
+    class Node(BaseModel):
+        v: int
+        children: list["Node"] = []
+        secret: dict[str, Any]
+        blob: dict[str, Any] = {}
+
+    Node.model_rebuild()
+    raw = b'{"v":1,"secret":{"x":1},"blob":{"a":1},"children":[{"v":2,"secret":{"y":2},"blob":{"b":2},"children":[]}]}'
+    n = Projected(Node, {Node: {"secret", "blob"}}).validate_json(raw)
+    assert "secret" not in n.__dict__ and n.blob == {}
+    child = n.children[0]
+    assert "secret" not in child.__dict__ and child.blob == {} and child.v == 2

@@ -100,17 +100,17 @@ def projected_validator(
                 if cfg.get("extra") == "forbid":
                     raise ValueError(
                         f"{cls.__qualname__} uses extra='forbid': the excluded key {name!r} would be "
-                        "rejected as an extra; use Projected, which removes it from the input"
+                        "rejected as an extra"
                     )
                 if cfg.get("extra") == "allow":
                     raise ValueError(
                         f"{cls.__qualname__} uses extra='allow': the excluded key {name!r} would be "
-                        "captured as an extra; use Projected, which removes it from the input"
+                        "captured as an extra"
                     )
                 if has_default and (cfg.get("populate_by_name") or cfg.get("validate_by_name")):
                     raise ValueError(
                         f"{cls.__qualname__} populates fields by name: the excluded field {name!r} would "
-                        "still be read under its name; use Projected, which removes it from the input"
+                        "still be read under its name"
                     )
             if has_default:
                 # keep the field but make its JSON key unreachable so pydantic applies the default
@@ -152,12 +152,16 @@ def _field_keys(name: str, alias: Any) -> list[str]:
     return list(dict.fromkeys(keys))
 
 
-def projection_spec(model: type[BaseModel], exclude: Exclude) -> dict[str, Any]:
-    """Derive the keep-spec for `model` minus the excluded fields from its core schema."""
-    excluded = normalize_exclude(model, exclude)
+def _derive_spec(model: type[BaseModel], excluded: dict[type, frozenset[str]]) -> tuple[dict[str, Any], bool]:
+    """The keep-spec for `model` minus `excluded`, and whether it covers every occurrence of every class.
+
+    A class that appears inside itself is cut off at its second occurrence (a spec is a finite tree), so
+    below that point the projection keeps whole values and cannot remove excluded keys; `complete` is False then.
+    """
     schema: dict[str, Any] = cast("dict[str, Any]", model.__pydantic_core_schema__)
     definitions: dict[str, dict[str, Any]] = {}
     _walk(schema, lambda n: definitions.__setitem__(n["ref"], n) if "ref" in n and n.get("type") != "definition-ref" else None)
+    complete = [True]
 
     def spec_for(node: dict[str, Any], seen: frozenset[type]) -> Any:
         t = node.get("type")
@@ -175,6 +179,7 @@ def projection_spec(model: type[BaseModel], exclude: Exclude) -> dict[str, Any]:
         if t == "model":
             cls = node["cls"]
             if cls in seen:
+                complete[0] = False
                 return True
             fields = _fields_node(node)
             if fields is None:
@@ -192,7 +197,12 @@ def projection_spec(model: type[BaseModel], exclude: Exclude) -> dict[str, Any]:
     root = spec_for(schema, frozenset())
     if not isinstance(root, dict):
         raise TypeError(f"{model.__qualname__}: could not derive an object spec from its core schema")
-    return root
+    return root, complete[0]
+
+
+def projection_spec(model: type[BaseModel], exclude: Exclude) -> dict[str, Any]:
+    """Derive the keep-spec for `model` minus the excluded fields from its core schema."""
+    return _derive_spec(model, normalize_exclude(model, exclude))[0]
 
 
 class Projected:
@@ -200,13 +210,19 @@ class Projected:
 
     Combines a byte projection (unwanted members are skipped by the Rust cursor) with a validator built
     from the model's core schema minus the excluded fields. Results are instances of the original classes.
+
+    For a model that appears inside itself the projection stops at the first recursion, so excluded keys
+    deeper down still reach the validator; such models must use `extra='ignore'`, and an excluded field
+    with a default must not be populated by name. `projected_validator` raises `ValueError` otherwise.
     """
 
     def __init__(self, model: type[BaseModel], exclude: Exclude) -> None:
         self.model = model
         self.exclude = normalize_exclude(model, exclude)
-        self.validator = projected_validator(model, self.exclude, assume_projected=True)
-        self.spec = Projection(projection_spec(model, self.exclude))
+        spec, complete = _derive_spec(model, self.exclude)
+        # the guards in projected_validator are only unnecessary when the projection removes every occurrence
+        self.validator = projected_validator(model, self.exclude, assume_projected=complete)
+        self.spec = Projection(spec)
 
     def validate_json(
         self,

@@ -185,7 +185,8 @@ an excluded key from the inputs it was given. `examples/inspect_adapters.py` hol
   `data["child"] = Child.model_validate(legacy)` hands pydantic a finished instance, and pydantic does not
   re-validate one, so the edited validator for `Child` never runs and `Child`'s excluded fields keep the
   values the migration gave them. Only raw dicts pass through the edited validator. Nothing in the library
-  can intercept this: register no adapter for such a class, or exclude nothing on the class it builds.
+  can intercept this, and withholding an adapter does not help -- a nested migration runs inside the
+  kept-whole subtree anyway -- so exclude nothing on the class such a migration builds.
 - The pydantic integration relies on the core-schema layout and on `SchemaValidator(..., _use_prebuilt=False)`,
   which pydantic does not promise to keep. CI tests the latest release and pre-release; a `RuntimeError` is
   raised if pydantic-core ignores the schema edit.

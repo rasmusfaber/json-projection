@@ -285,7 +285,8 @@ round-trip in `tests/test_inspect_ai.py`; `tests/test_pydantic.py` is unchanged.
   `data["child"] = Child.model_validate(legacy)` hands pydantic a finished instance, which pydantic does
   not re-validate, so the edited validator for `Child` never runs and exclusions on `Child` do not apply
   to that object. Only raw dicts pass through the edited validator, and nothing in the library can
-  intercept the construction. Documented in the README's "What you give up".
+  intercept the construction -- withholding an adapter does not help either, since a nested migration
+  runs inside the kept-whole subtree regardless. Documented in the README's "What you give up".
 - Reading a dependency without retaining it (parse `events` for `timelines`, then drop them).
 - Exclusion filtering after before-validators run and before field validation, which would let adapted
   classes drop the guards; and a contract for wrap validators that assign excluded attributes after their

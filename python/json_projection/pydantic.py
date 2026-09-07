@@ -597,11 +597,14 @@ def _derive_spec(
                     sources.setdefault(key, []).append(fschema)
                     if out.get(key, value) != value:
                         # two fields under one JSON key describe it differently: keep it whole. Every
-                        # field that ever described this key now sits inside a kept subtree, not just
-                        # this one and the previous, and two of them can agree while a third differs
+                        # field that has described this key so far is now inside a kept subtree, not
+                        # just this one and the previous: two of them can agree while a third differs.
+                        # Emptying the list keeps that linear -- once the key is `True`, the fields
+                        # already walked stay walked, and a later collision only brings its own
                         value = True
                         for contributor in sources[key]:
                             opaque(contributor, inner)
+                        sources[key] = []
                     out[key] = value
             if adapter is None:
                 return out

@@ -18,6 +18,7 @@ from pydantic import (
 )
 from pydantic_core import core_schema
 
+import json_projection.pydantic
 from json_projection.pydantic import AdapterContext, Projected, _keep_path, migration_adapter, projection_spec
 from migration_models import ADAPTERS as MIGRATION_ADAPTERS
 from migration_models import SAMPLE_ADAPTER, Item, Log, Sample
@@ -575,3 +576,28 @@ def test_a_widened_key_marks_every_field_behind_it_incomplete(order: tuple[str, 
 def test_a_widened_key_reaches_the_by_name_guard(order: tuple[str, ...]):
     with pytest.raises(ValueError, match="populates fields by name"):
         Projected(_triple(ByName, order), {ByName: {"child"}, Needs: {"values"}})
+
+
+def test_many_fields_on_one_colliding_key_stay_linear(monkeypatch: pytest.MonkeyPatch):
+    """Re-walking every earlier contributor at each collision made 512 aliases cost 0.7 s."""
+    n = 512
+    fields: dict[str, Any] = {"x": (dict[str, Any], {})}
+    fields.update({f"f{i}": (Plain, Field(default=None, validation_alias="x")) for i in range(n)})
+    many = create_model("Many", **fields)  # type: ignore[call-overload]
+
+    walks = [0]
+    real = json_projection.pydantic._reaches_excluded
+
+    def counting(*args: Any) -> bool:
+        walks[0] += 1
+        return real(*args)
+
+    monkeypatch.setattr(json_projection.pydantic, "_reaches_excluded", counting)
+    start = time.perf_counter()
+    spec = projection_spec(many, set())
+    elapsed = time.perf_counter() - start
+
+    # the field name is a key of its own beside the alias, so each field keeps its own sub-spec
+    assert spec == {"x": True, **{f"f{i}": {"v": True} for i in range(n)}}
+    assert walks[0] <= 2 * n + 10, walks[0]  # one pass per contributor, not one per pair
+    assert elapsed < 0.1

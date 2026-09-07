@@ -11,6 +11,9 @@
   missing adapter from a wrapper the adapter cannot vouch for: an outer before/wrap validator belongs to
   the class only when it is one of the class's own registered model validators (`@classmethod`,
   `@staticmethod` and inherited ones alike), not merely bound to it.
+- Fixed a 0.1 completeness hole: when three or more fields shared one JSON key and a later field widened
+  it to "kept whole", only the most recent field behind that key was accounted for, so an excluded key
+  could stay in the kept bytes while `complete` reported True and the standalone guards were dropped.
 - `Projected.complete` is a read-only property: a conservative proof that the projection removes every
   excluded key everywhere, which is what permits dropping the standalone config guards.
 - `projection_adapters` must name only classes that appear in the root model's schema; anything else is a

@@ -59,16 +59,20 @@ def _fields_node(model_node: dict[str, Any]) -> dict[str, Any] | None:
     return inner if isinstance(inner, dict) else None
 
 
-def projected_validator(model: type[BaseModel], exclude: Exclude) -> SchemaValidator:
+def projected_validator(
+    model: type[BaseModel], exclude: Exclude, *, assume_projected: bool = False
+) -> SchemaValidator:
     """A validator for `model` that never reads the excluded fields.
 
     Excluded fields with a default keep their default. Excluded required fields are absent from the
     resulting instances (and from ``model_fields_set``). Instances are of the original classes.
+
+    With ``assume_projected=False`` (validating raw input) classes whose configuration would still let
+    pydantic read an excluded key are refused with ``ValueError``: ``extra='forbid'`` or ``extra='allow'``,
+    and ``populate_by_name``/``validate_by_name`` when a field with a default is excluded. `Projected`
+    passes ``assume_projected=True`` because its byte projection removes those keys before validation.
     """
     excluded = normalize_exclude(model, exclude)
-    for cls in excluded:
-        if getattr(cls, "model_config", {}).get("extra") == "forbid":
-            raise ValueError(f"{cls.__qualname__} uses extra='forbid'; an excluded key would be rejected as extra")
     schema = _copy(model.__pydantic_core_schema__)
     config: list[Any] = []
     hit: set[tuple[type, str]] = set()
@@ -90,7 +94,25 @@ def projected_validator(model: type[BaseModel], exclude: Exclude) -> SchemaValid
             if field is None:
                 continue
             hit.add((cls, name))
-            if field["schema"].get("type") == "default":
+            has_default = field["schema"].get("type") == "default"
+            if not assume_projected:
+                cfg = getattr(cls, "model_config", {})
+                if cfg.get("extra") == "forbid":
+                    raise ValueError(
+                        f"{cls.__qualname__} uses extra='forbid': the excluded key {name!r} would be "
+                        "rejected as an extra; use Projected, which removes it from the input"
+                    )
+                if cfg.get("extra") == "allow":
+                    raise ValueError(
+                        f"{cls.__qualname__} uses extra='allow': the excluded key {name!r} would be "
+                        "captured as an extra; use Projected, which removes it from the input"
+                    )
+                if has_default and (cfg.get("populate_by_name") or cfg.get("validate_by_name")):
+                    raise ValueError(
+                        f"{cls.__qualname__} populates fields by name: the excluded field {name!r} would "
+                        "still be read under its name; use Projected, which removes it from the input"
+                    )
+            if has_default:
                 # keep the field but make its JSON key unreachable so pydantic applies the default
                 field["validation_alias"] = _EXCLUDED_ALIAS_PREFIX + name
             else:

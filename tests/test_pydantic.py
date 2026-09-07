@@ -95,3 +95,40 @@ def test_partial_instance_dumps_without_warning(recwarn):
     assert s.model_dump() == {"id": 1, "score": 0.1}
     assert s.model_dump_json() == '{"id":1,"score":0.1}'
     assert not [w for w in recwarn if "Pydantic" in str(w.message)]
+
+
+def test_allow_models_are_refused_standalone():
+    class Loose(BaseModel):
+        model_config = ConfigDict(extra="allow")
+        a: int
+        b: list[int]
+        c: dict[str, Any] = {}
+
+    with pytest.raises(ValueError, match="allow"):
+        projected_validator(Loose, {"b"})
+    with pytest.raises(ValueError, match="allow"):
+        projected_validator(Loose, {"c"})
+
+
+def test_by_name_models_are_refused_for_defaulted_fields_only():
+    class ByName(BaseModel):
+        model_config = ConfigDict(populate_by_name=True)
+        a: int = Field(validation_alias="A")
+        debug: dict[str, Any] = {}
+        events: list[int]
+
+    with pytest.raises(ValueError, match="by name"):
+        projected_validator(ByName, {"debug"})
+    v = projected_validator(ByName, {"events"})  # required: removed, key becomes unknown and is ignored
+    out = v.validate_json(b'{"a": 1, "events": [1, 2, 3]}')
+    assert "events" not in out.__dict__ and out.a == 1
+
+
+def test_assume_projected_skips_the_guards():
+    class Strict(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        a: int
+        b: list[int]
+
+    v = projected_validator(Strict, {"b"}, assume_projected=True)
+    assert "b" not in v.validate_json(b'{"a": 1}').__dict__  # input already projected: no excluded key present

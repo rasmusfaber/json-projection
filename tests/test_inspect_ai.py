@@ -82,3 +82,14 @@ def test_excluding_the_results_is_refused_while_samples_are_retained():
 def test_an_explicit_empty_exclusion_excludes_nothing():
     assert thin_eval_log({}).exclude == {}
     assert thin_eval_log().exclude == {EvalSample: BULK_FIELDS}
+
+
+def test_excluding_log_updates_is_refused_while_tags_are_retained():
+    """`_validate_tags_and_metadata` replays the edits in `log_updates` onto the eval-time values."""
+    exclude = {EvalSample: BULK_FIELDS, EvalLog: {"log_updates"}}
+    with pytest.raises(ValueError, match="retaining 'tags' requires 'log_updates'"):
+        Projected(EvalLog, exclude, projection_adapters=INSPECT_ADAPTERS)
+    both_gone = {EvalSample: BULK_FIELDS, EvalLog: {"log_updates", "tags", "metadata"}}
+    assert Projected(EvalLog, both_gone, projection_adapters=INSPECT_ADAPTERS).exclude == {
+        cls: frozenset(names) for cls, names in both_gone.items()
+    }

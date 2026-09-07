@@ -107,6 +107,33 @@ impl Projection {
             engine: Engine::new(plan.clone()),
         }
     }
+
+    /// Project a binary reader from its current position to EOF, leaving it open.
+    /// Read errors propagate; malformed or incomplete JSON raises ValueError.
+    #[pyo3(signature = (source, *, chunk_size = 65536))]
+    fn apply_stream<'py>(
+        &self,
+        py: Python<'py>,
+        source: &Bound<'py, PyAny>,
+        chunk_size: isize,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        if chunk_size <= 0 {
+            return Err(PyValueError::new_err("chunk_size must be positive"));
+        }
+        let read = source.getattr("read")?;
+        let mut session = self.stream();
+        loop {
+            py.check_signals()?;
+            let chunk = read.call1((chunk_size,))?;
+            let chunk = chunk
+                .cast::<PyBytes>()
+                .map_err(|_| PyTypeError::new_err("source.read() must return bytes"))?;
+            if chunk.as_bytes().is_empty() {
+                return session.finish(py);
+            }
+            session.feed(chunk)?;
+        }
+    }
 }
 
 /// A single JSON document, fed in binary chunks. Construct with `Projection.stream()`.

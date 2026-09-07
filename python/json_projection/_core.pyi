@@ -1,4 +1,5 @@
 from collections.abc import Iterable, Mapping
+from typing import Protocol
 
 __version__: str
 
@@ -8,6 +9,9 @@ True | nested spec | {"__all__": spec}."""
 
 Data = bytes | bytearray | memoryview | str
 
+class _BinaryReader(Protocol):
+    def read(self, size: int, /) -> bytes: ...
+
 class Projection:
     """A compiled keep-spec. Build once, apply to many documents."""
 
@@ -15,6 +19,7 @@ class Projection:
     def apply(self, data: Data, *, strict: bool = False) -> bytes: ...
     def __call__(self, data: Data, *, strict: bool = False) -> bytes: ...
     def stream(self) -> ProjectionStream: ...
+    def apply_stream(self, source: _BinaryReader, *, chunk_size: int = 65536) -> bytes: ...
 
 class ProjectionStream:
     """Strict, single-document stream. Create with Projection.stream()."""

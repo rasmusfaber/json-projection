@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Added streaming JSON projection that discards unwanted values without buffering the complete input.
+- Added streaming JSON projection from binary readers or byte chunks without buffering the complete input.
 
 ## 0.1.0 (unreleased)
 

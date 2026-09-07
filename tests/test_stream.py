@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import gc
+import gzip
+import io
+import signal
+import subprocess
 import sys
 from collections.abc import Iterable
+from pathlib import Path
 
 import pytest
 
@@ -22,6 +27,148 @@ def test_stream_public_api():
     session.feed(b'{"id":1,"discard":[')
     session.feed(b"1,2,3]}")
     assert session.finish() == b'{"id":1}'
+
+
+def test_apply_stream_reads_from_current_position_and_leaves_source_open() -> None:
+    source = io.BytesIO(b'prefix{"id":1,"drop":[2,3]} \n')
+    source.seek(len(b"prefix"))
+    assert Projection({"id"}).apply_stream(source) == b'{"id":1}'
+    assert source.tell() == len(source.getvalue())
+    assert not source.closed
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_apply_stream_reads_binary_files(tmp_path: Path, compressed: bool) -> None:
+    raw = b'{"id":1,"drop":[2,3]}'
+    path = tmp_path / "source"
+    path.write_bytes(gzip.compress(raw) if compressed else raw)
+    with gzip.open(path, "rb") if compressed else path.open("rb") as source:
+        assert Projection({"id"}).apply_stream(source, chunk_size=7) == b'{"id":1}'
+        assert source.read() == b""
+        assert not source.closed
+
+
+@pytest.mark.parametrize("chunk_size", [None, 1, 7])
+def test_apply_stream_accepts_short_reads(chunk_size: int | None) -> None:
+    class Reader:
+        def __init__(self) -> None:
+            self.source = io.BytesIO(b'{"id":1,"drop":[2,3]}')
+            self.requests: list[int] = []
+
+        def read(self, size: int, /) -> bytes:
+            self.requests.append(size)
+            return self.source.read(min(size, 3))
+
+    source = Reader()
+    projection = Projection({"id"})
+    result = (
+        projection.apply_stream(source)
+        if chunk_size is None
+        else projection.apply_stream(source, chunk_size=chunk_size)
+    )
+    assert result == b'{"id":1}'
+    assert len(source.requests) > 1
+    assert set(source.requests) == {65536 if chunk_size is None else chunk_size}
+
+
+@pytest.mark.parametrize("raw", [b"", b'{"id":1', b'{"id":1} \n!', b'{"drop":[1,]}'])
+def test_apply_stream_preserves_json_errors(raw: bytes) -> None:
+    projection = Projection({"id"})
+    with pytest.raises(ValueError) as expected:
+        run_chunks(projection, (raw,))
+    source = io.BytesIO(b"prefix" + raw)
+    source.seek(len(b"prefix"))
+    with pytest.raises(ValueError) as actual:
+        projection.apply_stream(source, chunk_size=1)
+    assert str(actual.value) == str(expected.value)
+    assert not source.closed
+
+
+@pytest.mark.parametrize("chunk_size", [0, -1])
+def test_apply_stream_rejects_nonpositive_chunk_size_before_reading(chunk_size: int) -> None:
+    source = io.BytesIO(b"{}")
+    with pytest.raises(ValueError, match="chunk_size must be positive"):
+        Projection(set()).apply_stream(source, chunk_size=chunk_size)
+    assert source.tell() == 0
+    assert not source.closed
+
+
+@pytest.mark.parametrize("chunk_size", [None, 1.5, "7"])
+def test_apply_stream_requires_integer_chunk_size(chunk_size) -> None:
+    source = io.BytesIO(b"{}")
+    with pytest.raises(TypeError):
+        Projection(set()).apply_stream(source, chunk_size=chunk_size)
+    assert source.tell() == 0
+
+
+@pytest.mark.parametrize("value", ["", "{}", None, bytearray(), memoryview(b"")])
+def test_apply_stream_requires_binary_read_results(value) -> None:
+    class Reader:
+        def read(self, size: int, /):
+            return value
+
+    with pytest.raises(TypeError, match=r"source.read\(\) must return bytes"):
+        Projection(set()).apply_stream(Reader())
+
+
+class FailingReader:
+    def __init__(self, prefix: bytes, error: OSError) -> None:
+        self.prefix = prefix
+        self.error = error
+        self.requests = 0
+
+    def read(self, size: int, /) -> bytes:
+        self.requests += 1
+        if self.requests == 1:
+            return self.prefix[:size]
+        raise self.error
+
+
+def test_apply_stream_propagates_read_errors() -> None:
+    error = OSError("connection lost")
+    source = FailingReader(b'{"id":1,', error)
+    projection = Projection({"id"})
+    with pytest.raises(OSError) as actual:
+        projection.apply_stream(source)
+    assert actual.value is error
+    assert projection.apply_stream(io.BytesIO(b'{"id":2}')) == b'{"id":2}'
+
+
+def test_apply_stream_stops_reading_on_json_error() -> None:
+    source = FailingReader(b'{"id":1,]', OSError("must not read after malformed input"))
+    with pytest.raises(ValueError, match="invalid JSON"):
+        Projection({"id"}).apply_stream(source)
+    assert source.requests == 1
+
+
+@pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="requires POSIX interval timers")
+def test_apply_stream_checks_signals_between_native_reads() -> None:
+    probe = """
+import io
+import signal
+
+from json_projection import Projection
+
+raw = b'{"drop":[' + b'0,' * (32 * 1024 * 1024) + b'0]}'
+source = io.BytesIO(raw)
+projection = Projection(set())
+
+def interrupt(signum, frame):
+    raise TimeoutError("timer expired")
+
+signal.signal(signal.SIGPROF, interrupt)
+try:
+    signal.setitimer(signal.ITIMER_PROF, 0.02)
+    projection.apply_stream(source)
+except TimeoutError:
+    assert source.tell() < len(raw), (source.tell(), len(raw))
+else:
+    raise AssertionError("timer did not interrupt projection")
+finally:
+    signal.setitimer(signal.ITIMER_PROF, 0)
+"""
+    result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_sessions_are_created_by_the_projection():

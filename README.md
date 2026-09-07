@@ -40,7 +40,27 @@ A spec is a set of root keys, or a mapping where a key maps to `True` (keep the 
 
 ### Streaming input
 
-Use `Projection.stream()` to process one JSON object in binary chunks:
+Use `Projection.apply_stream()` to project one JSON object from a binary file-like source:
+
+```python
+from json_projection import Projection
+
+projection = Projection({"id", "scores"})
+with open("sample.json", "rb") as source:
+    projected = projection.apply_stream(source)
+```
+
+The source only needs a `read(size) -> bytes` method, so binary files, `BytesIO`, compressed files, and
+custom readers work. The helper reads from the current position until `b""` signals EOF, allowing short
+reads and leaving the source open. `chunk_size` is a positive integer and defaults to 65536 bytes;
+`projection.apply_stream(source, chunk_size=4096)` changes the requested read size. Non-bytes read results
+raise `TypeError`, including text streams and `None` from a nonblocking reader. Read errors propagate.
+
+The helper uses the same strict scanner and buffered output as the session API below. JSON error offsets
+start at zero for the bytes read by this call, even when the source begins at a nonzero position. On error,
+the source remains at the position reached by its last read.
+
+Use `Projection.stream()` to supply chunks yourself:
 
 ```python
 from json_projection import Projection

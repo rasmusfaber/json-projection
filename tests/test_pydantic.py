@@ -7,7 +7,16 @@ from unittest import mock
 
 import pydantic
 import pytest
-from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    AliasPath,
+    BaseModel,
+    ConfigDict,
+    Field,
+    RootModel,
+    field_validator,
+    model_validator,
+)
 from typing_extensions import TypedDict
 
 from json_projection import project
@@ -597,3 +606,52 @@ def test_root_model_before_validator_cannot_be_projected():
                 return handler(value)
 
         Projected(Wrapped, {"x"})
+
+
+def test_a_default_that_looks_like_a_schema_is_not_walked():
+    class M(BaseModel):
+        options: dict[str, str] = {"type": "model"}
+        junk: dict[str, Any] = {}
+
+    assert Projected(M, {"junk"}).validate_json(b'{"junk":{"a":1}}').options == {"type": "model"}
+
+
+def test_a_self_referential_default_is_not_copied():
+    cyclic: dict[str, Any] = {}
+    cyclic["self"] = cyclic
+
+    class M(BaseModel):
+        options: dict[str, Any] = Field(default=cyclic)
+        junk: dict[str, Any] = {}
+
+    out = Projected(M, {"junk"}).validate_json(b"{}")
+    assert out.options["self"] is out.options  # pydantic deep-copies the default; the cycle survives
+
+
+def test_the_original_core_schema_is_not_mutated():
+    class Sub(BaseModel):
+        keep: int
+        secret: int = 0
+
+    class Outer(BaseModel):
+        sub: Sub
+
+    before = repr(Outer.__pydantic_core_schema__)
+    Projected(Outer, {Sub: {"secret"}})
+    assert repr(Outer.__pydantic_core_schema__) == before
+    assert Outer.model_validate_json(b'{"sub":{"keep":1,"secret":9}}').sub.secret == 9
+
+
+def test_root_model_fields_are_not_taken_from_the_wrapped_class():
+    class Child(BaseModel):
+        x: int
+
+    class Root(RootModel[Child]):
+        pass
+
+    with pytest.raises(ValueError, match="Root.x"):
+        projected_validator(Root, {"x"})
+    with pytest.raises(TypeError):
+        projection_spec(Root, set())
+    with pytest.raises(TypeError):
+        Projected(Root, {"x"})

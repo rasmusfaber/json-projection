@@ -36,23 +36,47 @@ def normalize_exclude(model: type[BaseModel], exclude: Exclude) -> dict[type, fr
     return {model: frozenset(exclude)}
 
 
+_DATA_KEYS = frozenset({"default", "metadata", "serialization", "json_schema_extra"})
+"""Keys whose values are user data or output-side settings, not schemas to descend into.
+
+A field default is arbitrary Python: it may be a dict that happens to look like a schema node, and it
+may even contain itself. Neither traversal has any business inside one.
+"""
+
+
 def _copy(node: Any) -> Any:
-    """Structural copy: dicts and lists are copied, leaves (classes, functions) are shared."""
+    """Structural copy along schema edges; leaves (classes, functions) and `_DATA_KEYS` are shared."""
     if isinstance(node, dict):
-        return {k: _copy(v) for k, v in node.items()}
+        return {k: v if k in _DATA_KEYS else _copy(v) for k, v in node.items()}
     if isinstance(node, list):
         return [_copy(v) for v in node]
+    if isinstance(node, tuple):  # a tagged union's (schema, tag) choices
+        return tuple(_copy(v) for v in node)
     return node
 
 
 def _walk(node: Any, fn: Any) -> None:
+    """Call `fn` on every schema node reachable along schema edges."""
     if isinstance(node, dict):
         fn(node)
-        for v in node.values():
-            _walk(v, fn)
-    elif isinstance(node, list):
+        for k, v in node.items():
+            if k not in _DATA_KEYS:
+                _walk(v, fn)
+    elif isinstance(node, (list, tuple)):
         for v in node:
             _walk(v, fn)
+
+
+def _definitions(schema: Any) -> dict[str, dict[str, Any]]:
+    """Every node that defines a `ref`, keyed by it, so that a `definition-ref` can be resolved."""
+    found: dict[str, dict[str, Any]] = {}
+
+    def record(node: dict[str, Any]) -> None:
+        if "ref" in node and node.get("type") != "definition-ref":
+            found[node["ref"]] = node
+
+    _walk(schema, record)
+    return found
 
 
 def _extra(cls: type) -> Any:
@@ -63,21 +87,34 @@ def _extra(cls: type) -> Any:
 _OPAQUE_WRAPPERS = ("function-before", "function-wrap", "function-plain")
 """Validators whose input shape is unknown: the schema they wrap does not describe what they are given."""
 
+_WRAPPERS = ("default", "nullable", "definitions", "definition-ref", "function-after", *_OPAQUE_WRAPPERS)
 
-def _fields_node(model_node: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
-    """`model` -> ... -> `model-fields`, looking through function-validator wrappers.
 
-    Returns the `model-fields` node and the kind of the first before/wrap/plain wrapper passed on the
-    way, which makes the fields useless for deriving a projection (the validator's input is not the
-    shape they describe).
+def _fields_node(
+    model_node: dict[str, Any], definitions: dict[str, dict[str, Any]]
+) -> tuple[dict[str, Any] | None, str | None]:
+    """`model` -> `model-fields`, through wrapper nodes only, stopping at any nested `model`.
+
+    Returns the `model-fields` node -- None when the class declares no fields of its own, as for a
+    `RootModel`, whose `model` node wraps the type it is a root for -- and the kind of the first
+    before/wrap/plain wrapper passed on the way, which makes the fields useless for deriving a
+    projection (the validator's input is not the shape they describe).
     """
-    inner = model_node.get("schema")
+    node: Any = model_node.get("schema")
     opaque_kind: str | None = None
-    while isinstance(inner, dict) and inner.get("type") != "model-fields":
-        if inner["type"] in _OPAQUE_WRAPPERS and opaque_kind is None:
-            opaque_kind = inner["type"]
-        inner = inner.get("schema")
-    return (inner if isinstance(inner, dict) else None), opaque_kind
+    while isinstance(node, dict):
+        t = node.get("type")
+        if t == "model-fields":
+            return node, opaque_kind
+        if t == "definition-ref":
+            node = definitions.get(node.get("schema_ref", ""))
+            continue
+        if t not in _WRAPPERS:
+            return None, opaque_kind  # a nested model, or any other schema: not this class's fields
+        if t in _OPAQUE_WRAPPERS and opaque_kind is None:
+            opaque_kind = t
+        node = node.get("schema")
+    return None, opaque_kind
 
 
 def projected_validator(
@@ -98,6 +135,7 @@ def projected_validator(
     """
     excluded = normalize_exclude(model, exclude)
     schema = _copy(model.__pydantic_core_schema__)
+    definitions = _definitions(schema)
     config: list[Any] = []
     hit: set[tuple[type, str]] = set()
 
@@ -110,11 +148,10 @@ def projected_validator(
         names = excluded.get(cls)
         if not names:
             return
-        fields, _ = _fields_node(node)
+        fields, _ = _fields_node(node, definitions)
         if fields is None:
-            raise TypeError(
-                f"{cls.__qualname__}: no 'model-fields' under its 'model' node; core schema shape changed"
-            )
+            # no fields of its own (a RootModel wraps another schema); the check below reports the names
+            return
         for name in names:
             field = fields["fields"].get(name)
             if field is None:
@@ -196,13 +233,7 @@ def _derive_spec(model: type[BaseModel], excluded: dict[type, frozenset[str]]) -
     subtree is projected, so `complete` is False as soon as an excluded class is reachable in one.
     """
     schema: dict[str, Any] = cast("dict[str, Any]", model.__pydantic_core_schema__)
-    definitions: dict[str, dict[str, Any]] = {}
-
-    def _record_ref(n: dict[str, Any]) -> None:
-        if "ref" in n and n.get("type") != "definition-ref":
-            definitions[n["ref"]] = n
-
-    _walk(schema, _record_ref)
+    definitions = _definitions(schema)
     complete = [True]
     wrapper_kind: list[str] = []
 
@@ -265,7 +296,7 @@ def _derive_spec(model: type[BaseModel], excluded: dict[type, frozenset[str]]) -
             if _extra(cls) == "allow" and not excluded.get(cls):
                 # undeclared keys are data on this class, so keep the whole object
                 return opaque(node)
-            fields, kind = _fields_node(node)
+            fields, kind = _fields_node(node, definitions)
             if kind is not None:
                 wrapper_kind.append(kind)
                 return opaque(node)

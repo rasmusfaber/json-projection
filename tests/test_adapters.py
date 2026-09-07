@@ -497,3 +497,37 @@ def test_a_field_behind_an_alias_path_calls_its_adapter_once():
 
     projection_spec(AliasHolder, {Legacy: {"payload"}}, projection_adapters={Legacy: record})
     assert calls == Counter({Legacy: 1})
+
+
+class Needs(BaseModel):
+    total: int = 0
+    values: list[int] = []
+
+
+class Container(BaseModel):
+    child: Optional[Needs] = None
+    v: int = 0
+
+
+class AliasedContainer(BaseModel):
+    container: Container = Field(validation_alias=AliasPath("outer", "container"))
+
+
+NEEDS_ADAPTERS = {Needs: migration_adapter(requires={"total": ["values"]})}
+EXCLUDE_BELOW = {Container: {"child"}, Needs: {"values"}}
+
+
+def test_an_adapter_below_an_excluded_field_of_an_aliased_subtree_still_runs():
+    """The real derivation steps over `Container.child`, so only the discard pass reaches `Needs`."""
+    with pytest.raises(ValueError, match="retaining 'total' requires 'values'"):
+        Projected(AliasedContainer, EXCLUDE_BELOW, projection_adapters=NEEDS_ADAPTERS)
+
+
+@pytest.mark.parametrize("dict_first", [True, False], ids=["dict-first", "model-first"])
+def test_an_adapter_below_an_excluded_field_of_a_colliding_subtree_still_runs(dict_first: bool):
+    """Two fields under the JSON key `x`, so both are kept whole; either declaration order."""
+    collide = {"c": (Container, Field(default=None, validation_alias="x"))}
+    fields = {"x": (dict[str, Any], {}), **collide} if dict_first else {**collide, "x": (dict[str, Any], {})}
+    model = create_model("Colliding", **fields)  # type: ignore[call-overload]
+    with pytest.raises(ValueError, match="retaining 'total' requires 'values'"):
+        Projected(model, EXCLUDE_BELOW, projection_adapters=NEEDS_ADAPTERS)

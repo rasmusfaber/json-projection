@@ -507,33 +507,27 @@ def _derive_spec(
     foreign: list[tuple[str, type]] = []  # (wrapper kind, adapted class) for wrappers it does not own
     derived: set[type] = set()  # classes this call has already derived, for real or to discard
 
-    def kept(node: dict[str, Any]) -> bool:
-        """Keep this subtree whole, and say so: `True`.
-
-        Below a kept subtree nothing is projected, so an excluded class reachable in it keeps its keys
-        and the derivation is no longer complete. Use this where the subtree's adapters have already
-        been run -- a field the loop below has just derived for real -- and `opaque` otherwise.
-        """
-        if _reaches_excluded(node, definitions, excluded):
-            complete[0] = False
-        return True
-
     def opaque(node: dict[str, Any], seen: frozenset[type]) -> bool:
         """Keep this subtree whole, and derive the adapted classes in it for their errors alone.
 
-        Every fallback goes through here. An adapter has to see every occurrence of its class: keeping
-        the bytes whole answers "what survives projection", not "can this migration live with these
-        exclusions", and a `requires` conflict or a misspelt field name must be reported wherever the
-        class appears, not only where the projection happens to reach. The spec that comes back is
-        thrown away.
+        Every fallback goes through here. Below a kept subtree nothing is projected, so an excluded
+        class reachable in it keeps its keys and the derivation is no longer complete.
+
+        An adapter has to see every occurrence of its class: keeping the bytes whole answers "what
+        survives projection", not "can this migration live with these exclusions", and a `requires`
+        conflict or a misspelt field name must be reported wherever the class appears, not only where
+        the projection happens to reach. The spec that comes back is thrown away.
 
         `derived` makes that pass linear. A class is derived once per call, and deriving it already
         walked its own descendants, so a nested subtree's classes are all in `derived` by the time an
         enclosing subtree gets to them -- without that, each level would redo every level below it,
         which costs 2**N adapter calls for N nested layers. It subsumes the `seen` ancestry check too:
-        the model branch adds a class to `derived` before it adds it to `seen`.
+        the model branch adds a class to `derived` before it adds it to `seen`. It is also why calling
+        this on a schema the derivation has just walked is cheap rather than free: the classes it
+        reached are skipped, and only the ones it stepped over -- below an excluded field -- are run.
         """
-        kept(node)
+        if _reaches_excluded(node, definitions, excluded):
+            complete[0] = False
         for model_node in _subtree_models(node, definitions):
             if model_node["cls"] in adapters and model_node["cls"] not in derived:
                 spec_for(model_node, seen)  # marks it derived on the way in
@@ -597,14 +591,14 @@ def _derive_spec(
                 sub = spec_for(fschema, inner)
                 for key, direct in _field_keys(name, field.get("validation_alias")):
                     # a multi-segment alias path names an enclosing object, not the field's own value.
-                    # `kept`, not `opaque`: these schemas have been derived for real already, so a
-                    # discard pass over them would only call their adapters a second time
-                    value = sub if direct else kept(fschema)
+                    # `opaque`, even though `spec_for` has just walked these: it skipped their excluded
+                    # fields, and an adapted class under one of those has still had no adapter call
+                    value = sub if direct else opaque(fschema, inner)
                     if out.get(key, value) != value:
                         # two fields under one JSON key describe it differently: keep it whole
                         value = True
-                        kept(fschema)
-                        kept(source[key])
+                        opaque(fschema, inner)
+                        opaque(source[key], inner)
                     out[key] = value
                     source[key] = fschema
             if adapter is None:

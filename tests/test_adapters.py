@@ -531,3 +531,47 @@ def test_an_adapter_below_an_excluded_field_of_a_colliding_subtree_still_runs(di
     model = create_model("Colliding", **fields)  # type: ignore[call-overload]
     with pytest.raises(ValueError, match="retaining 'total' requires 'values'"):
         Projected(model, EXCLUDE_BELOW, projection_adapters=NEEDS_ADAPTERS)
+
+
+class ByName(Container):
+    """`populate_by_name` makes the guards refuse an excluded defaulted field once complete is False."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class Plain(BaseModel):
+    v: int = 0
+
+
+def _triple(container: type[BaseModel], order: tuple[str, ...]) -> type[BaseModel]:
+    """Three fields under the JSON key `x`: two models that agree, and a dict that does not."""
+    fields: dict[str, Any] = {
+        "c": (container, Field(default=None, validation_alias="x")),
+        "p": (Plain, Field(default=None, validation_alias="x")),
+        "x": (dict[str, Any], {}),
+    }
+    return create_model("Triple", **{name: fields[name] for name in order})  # type: ignore[call-overload]
+
+
+ORDERS = [("c", "p", "x"), ("p", "c", "x")]
+
+
+@pytest.mark.parametrize("order", ORDERS, ids=["container-first", "plain-first"])
+def test_every_field_behind_a_colliding_key_is_checked_when_it_widens(order: tuple[str, ...]):
+    """`c` and `p` describe `x` identically, so only the third field widens it -- and `c` is not last."""
+    with pytest.raises(ValueError, match="retaining 'total' requires 'values'"):
+        Projected(_triple(Container, order), EXCLUDE_BELOW, projection_adapters=NEEDS_ADAPTERS)
+
+
+@pytest.mark.parametrize("order", ORDERS, ids=["container-first", "plain-first"])
+def test_a_widened_key_marks_every_field_behind_it_incomplete(order: tuple[str, ...]):
+    thin = Projected(_triple(Container, order), EXCLUDE_BELOW)
+    assert thin.complete is False  # `Container` is inside the kept `x`, so the guards stay on
+    got = thin.validate_json(b'{"x": {"child": {"total": 1, "values": [1]}, "v": 2}}')
+    assert got.c.child is None  # excluded and defaulted, and the alias redirect held
+
+
+@pytest.mark.parametrize("order", ORDERS, ids=["container-first", "plain-first"])
+def test_a_widened_key_reaches_the_by_name_guard(order: tuple[str, ...]):
+    with pytest.raises(ValueError, match="populates fields by name"):
+        Projected(_triple(ByName, order), {ByName: {"child"}, Needs: {"values"}})

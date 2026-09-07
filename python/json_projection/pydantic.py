@@ -583,7 +583,7 @@ def _derive_spec(
             if fields is None:
                 return opaque(node, inner)
             out: dict[str, Any] = {}
-            source: dict[str, dict[str, Any]] = {}  # the field schema each kept key came from
+            sources: dict[str, list[dict[str, Any]]] = {}  # every field schema a kept key came from
             for name, field in fields["fields"].items():
                 if name in excluded.get(cls, ()):
                     continue
@@ -591,16 +591,18 @@ def _derive_spec(
                 sub = spec_for(fschema, inner)
                 for key, direct in _field_keys(name, field.get("validation_alias")):
                     # a multi-segment alias path names an enclosing object, not the field's own value.
-                    # `opaque`, even though `spec_for` has just walked these: it skipped their excluded
-                    # fields, and an adapted class under one of those has still had no adapter call
+                    # `opaque`, even though `spec_for` has just walked this: it skipped the field's
+                    # excluded fields, and an adapted class under one of those has had no adapter call
                     value = sub if direct else opaque(fschema, inner)
+                    sources.setdefault(key, []).append(fschema)
                     if out.get(key, value) != value:
-                        # two fields under one JSON key describe it differently: keep it whole
+                        # two fields under one JSON key describe it differently: keep it whole. Every
+                        # field that ever described this key now sits inside a kept subtree, not just
+                        # this one and the previous, and two of them can agree while a third differs
                         value = True
-                        opaque(fschema, inner)
-                        opaque(source[key], inner)
+                        for contributor in sources[key]:
+                            opaque(contributor, inner)
                     out[key] = value
-                    source[key] = fschema
             if adapter is None:
                 return out
             retained = frozenset(n for n in fields["fields"] if n not in excluded.get(cls, ()))

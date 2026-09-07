@@ -170,11 +170,21 @@ Every kept-whole subtree is still searched for adapted classes (following each `
 and each one found is derived once and the result discarded. "Once" is per derivation, not per subtree:
 a class the derivation has already entered -- for real or to discard -- is skipped, because deriving it
 already walked its own descendants. Without that, each nesting level would redo every level below it,
-which costs 2**N adapter calls for N nested kept-whole layers. A field the surrounding model has just
-derived for real is likewise not searched again; only its completeness is recorded. Keeping the bytes whole answers "what survives projection", not "can this migration
-live with these exclusions": an adapter's `requires` conflict, unknown field name or hand-written
-refusal must be reported wherever its class occurs, not only where the projection reaches. The discarded
-derivation cannot add keys to the spec; it can only make `complete` more conservative.
+which costs 2**N adapter calls for N nested kept-whole layers.
+
+Every fallback runs that same pass, the alias-path and colliding-key ones included, even though the
+enclosing model has just derived those field schemas for real: the real derivation steps over the
+field's own excluded fields, so an adapted class below one of those has still had no adapter call. The
+memo is what makes running it there cheap -- the classes the real derivation reached are skipped, and
+only the ones it stepped over are run. When a JSON key is widened to `True` because a later field
+describes it differently, *every* field schema recorded for that key gets the pass, not just the newest
+and the previous one: two fields can describe a key identically and a third widen it, and the earlier
+two are then inside the kept subtree just as much as the third.
+
+Keeping the bytes whole answers "what survives projection", not "can this migration live with these
+exclusions": an adapter's `requires` conflict, unknown field name or hand-written refusal must be
+reported wherever its class occurs, not only where the projection reaches. The discarded derivation
+cannot add keys to the spec; it can only make `complete` more conservative.
 
 An input path or control that names an excluded field's key re-adds that key to the JSON. The field is
 still excluded from the result by the schema edit (popped if required, defaulted through the alias

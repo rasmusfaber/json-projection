@@ -144,3 +144,39 @@ def test_a_mapping_that_mutates_the_spec_while_it_compiles_does_not_panic():
 
     spec["x"] = Mutator()
     assert isinstance(project(b'{"x": 1, "added": 2}', spec), bytes)
+
+
+def test_raw_key_spelling_and_projected_whitespace():
+    raw = b'{ \n "\\u0061" \t : \n 1.00 , "drop": false , "a": [ 2 , 3 ] \n}'
+    assert project(raw, {"a"}, strict=True) == b'{"\\u0061" \t : \n 1.00,"a": [ 2 , 3 ]}'
+
+
+@pytest.mark.parametrize("negative", [False, True])
+@pytest.mark.parametrize("digits", [4299, 4300, 4301])
+def test_integer_prefix_limit_includes_sign(negative: bool, digits: int):
+    raw = b'{"drop":' + (b"-" if negative else b"") + b"1" * digits + b"}"
+    if digits + negative > 4300:
+        with pytest.raises(ValueError):
+            project(raw, set(), strict=True)
+    else:
+        assert project(raw, set(), strict=True) == b"{}"
+
+
+@pytest.mark.parametrize("number", [b"0." + b"1" * 5000, b"1e" + b"1" * 5000])
+def test_fraction_and_exponent_do_not_have_integer_length_limit(number: bytes):
+    assert project(b'{"drop":' + number + b"}", set(), strict=True) == b"{}"
+
+
+@pytest.mark.parametrize("escaped", [b"\\uDC00", b"\\uD800", b"\\uD800\\u0041"])
+def test_invalid_surrogates_are_rejected_even_when_discarded(escaped: bytes):
+    with pytest.raises(ValueError):
+        project(b'{"drop":"' + escaped + b'"}', set(), strict=True)
+
+
+def test_projection_descent_restarts_the_subtree_depth_budget():
+    spec: Any = True
+    raw = b"0"
+    for _ in range(220):
+        spec = {"k": spec}
+        raw = b'{"k":' + raw + b"}"
+    assert project(raw, spec, strict=True) == raw

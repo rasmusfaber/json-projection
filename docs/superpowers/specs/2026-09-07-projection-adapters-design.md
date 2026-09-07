@@ -71,9 +71,9 @@ adapters affect only the byte projection.
 ```python
 @dataclass(frozen=True)
 class AdapterContext:
-    model: type[BaseModel]      # the class this JSON object validates into
-    fields: frozenset[str]      # declared fields retained after exclusion, by field name
-    spec: dict[str, Any]        # the derived spec for those fields; keys are JSON keys (aliases applied)
+    model: type[BaseModel]  # the class this JSON object validates into
+    fields: frozenset[str]  # declared fields retained after exclusion, by field name
+    spec: dict[str, Any]  # the derived spec for those fields; keys are JSON keys (aliases applied)
 ```
 
 `spec` is a fresh dict per call; the adapter may modify and return it.
@@ -162,18 +162,18 @@ from json_projection.pydantic import migration_adapter
 
 sample_adapter = migration_adapter(
     inputs={
-        "scores": ["score"],                       # legacy single score
-        "events": [("transcript", "events")],      # legacy transcript holds events and attachments
+        "scores": ["score"],  # legacy single score
+        "events": [("transcript", "events")],  # legacy transcript holds events and attachments
         "attachments": [("transcript", "content")],
     },
-    controls=["score"],                            # the validator rejects score next to scores
-    requires={"timelines": ["events"]},            # timelines reference events by id
+    controls=["score"],  # the validator rejects score next to scores
+    requires={"timelines": ["events"]},  # timelines reference events by id
 )
 
 log_adapter = migration_adapter(
     inputs={
         "reductions": [("results", "sample_reductions")],
-        "results": ["reductions"],                 # the reverse fill
+        "results": ["reductions"],  # the reverse fill
     },
     controls=["version"],
 )

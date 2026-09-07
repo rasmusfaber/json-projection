@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 mod spec;
+mod walk;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {

@@ -4,6 +4,7 @@ import math
 import pytest
 
 from json_projection import Projection, project
+from reference import corpus, reference_project
 
 
 def test_project_root_keys_from_set():
@@ -81,3 +82,14 @@ def test_non_dict_mapping_spec_is_honoured():
 
     out = project(b'{"a": {"x": 1, "y": 2}, "b": 1}', MappingProxyType({"a": {"x": True}}))
     assert out == b'{"a": {"x": 1}}'
+
+
+def _canon(obj):
+    return json.dumps(obj, sort_keys=True)  # NaN/Infinity serialise as literals, so they compare equal
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_matches_reference_on_generated_corpus(seed):
+    for raw, spec in corpus(seed, 1500):
+        out = project(raw, spec)
+        assert _canon(json.loads(out)) == _canon(reference_project(json.loads(raw), spec)), (raw, spec)

@@ -134,7 +134,7 @@ opaque fallback:
 
 1. Look up `adapters.get(cls)`. Without an adapter the 0.1 behaviour stands: before/wrap/plain wrappers
    make the class opaque, and a root that is opaque raises `TypeError`. The message gains: "register a
-   projection adapter for `<Cls>` (`projection_adapters=...`) to project through the validator".
+   projection adapter for `<Cls>` (`projection_adapters=...`) to say what it reads".
 2. pydantic applies a `mode='wrap'` model validator *outside* the model node it wraps
    (`function-wrap -> model -> function-before -> model-fields`, for a class with both a wrap and a
    before validator), not inside it like `mode='before'`. So the derivation also looks through outer
@@ -278,6 +278,11 @@ round-trip in `tests/test_inspect_ai.py`; `tests/test_pydantic.py` is unchanged.
 
 ## Out of scope (recorded for later)
 
+- Migrations that construct model instances. A before validator that does
+  `data["child"] = Child.model_validate(legacy)` hands pydantic a finished instance, which pydantic does
+  not re-validate, so the edited validator for `Child` never runs and exclusions on `Child` do not apply
+  to that object. Only raw dicts pass through the edited validator, and nothing in the library can
+  intercept the construction. Documented in the README's "What you give up".
 - Reading a dependency without retaining it (parse `events` for `timelines`, then drop them).
 - Exclusion filtering after before-validators run and before field validation, which would let adapted
   classes drop the guards; and a contract for wrap validators that assign excluded attributes after their

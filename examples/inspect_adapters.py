@@ -9,11 +9,20 @@ adapters below tell json-projection which JSON inputs each retained field may ne
     EvalSample.attachments  <- legacy `transcript.content`
     EvalSample.timelines    requires EvalSample.events (resolved by uuid)
     EvalLog.reductions      <- legacy `results.sample_reductions`
+    EvalLog.samples         requires EvalLog.results (legacy score names come from `results.scores[0].name`)
     EvalSpec.*_args_passed  <- fallback `task_args` / `solver_args`
 
 A legacy `sandbox` array under `EvalSpec`/`EvalSample` needs nothing: it sits under a declared key, and a kept
-value whose shape does not match its sub-spec is copied raw. This module is documentation, not part of the
-json-projection package; it needs `inspect_ai` installed.
+value whose shape does not match its sub-spec is copied raw.
+
+One dependency here cannot be expressed and is therefore unsupported:
+`EvalLog.populate_scorer_name_for_samples` reads `results.scores[0].name` off the *validated*
+`EvalResults`, so excluding `EvalResults.scores` -- rather than `EvalLog.results`, which the `requires`
+above does catch -- silently renames the placeholder score of a legacy sample. `requires` relates fields
+of one class; it cannot say "EvalSample.scores needs EvalResults.scores". Do not exclude anything
+under `EvalResults` while retaining samples.
+
+This module is documentation, not part of the json-projection package; it needs `inspect_ai` installed.
 """
 
 from __future__ import annotations
@@ -30,7 +39,12 @@ SAMPLE_ADAPTER = migration_adapter(
     },
     requires={"timelines": ["events"]},
 )
-LOG_ADAPTER = migration_adapter(inputs={"reductions": [("results", "sample_reductions")]})
+LOG_ADAPTER = migration_adapter(
+    inputs={"reductions": [("results", "sample_reductions")]},
+    # `populate_scorer_name_for_samples` renames a legacy sample's placeholder score from
+    # `results.scores[0].name`, so retaining samples without results would silently change score keys
+    requires={"samples": ["results"]},
+)
 SPEC_ADAPTER = migration_adapter(
     inputs={"task_args_passed": ["task_args"], "solver_args_passed": ["solver_args"]},
 )
@@ -46,5 +60,10 @@ one without the other is rejected at construction.
 
 
 def thin_eval_log(exclude: Exclude | None = None) -> Projected:
-    """`Projected` for `EvalLog`; by default the per-sample bulk fields are never parsed."""
-    return Projected(EvalLog, exclude or {EvalSample: BULK_FIELDS}, projection_adapters=INSPECT_ADAPTERS)
+    """`Projected` for `EvalLog`; by default the per-sample bulk fields are never parsed.
+
+    An explicit empty `exclude` means exclude nothing; only `None` selects the default.
+    """
+    if exclude is None:
+        exclude = {EvalSample: BULK_FIELDS}
+    return Projected(EvalLog, exclude, projection_adapters=INSPECT_ADAPTERS)

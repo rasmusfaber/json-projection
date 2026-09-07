@@ -15,7 +15,7 @@
   excluded key everywhere, which is what permits dropping the standalone config guards.
 - `examples/inspect_adapters.py`: adapters for inspect_ai's `EvalLog`.
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-09-07)
 
 - `project()` and `Projection`: keep-spec driven byte projection over jiter's cursor.
 - `json_projection.pydantic`: `Projected`, `projected_validator`, `projection_spec` for pydantic >= 2.13.

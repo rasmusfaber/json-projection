@@ -137,14 +137,17 @@ sample_adapter = migration_adapter(
 )
 
 thin = Projected(
-    Log, exclude={Sample: {"events", "attachments"}}, projection_adapters={Sample: sample_adapter}
+    Log,
+    # timelines go with events: the declared dependency refuses one without the other
+    exclude={Sample: {"events", "attachments", "timelines"}},
+    projection_adapters={Sample: sample_adapter},
 )
 ```
 
 `inputs` are merged only for retained fields, so excluding `events` and `attachments` also drops
 `transcript`. `controls` are kept whenever present. Retaining a field whose dependency is excluded makes
-`Projected(...)` raise `ValueError`. With the inspect_ai adapters that means `timelines` must go whenever
-`events` does. Anything the helper cannot express is a plain callable
+`Projected(...)` raise `ValueError`, which is why the example above must drop `timelines` too; with the
+inspect_ai adapters, likewise, `timelines` must go whenever `events` does. Anything the helper cannot express is a plain callable
 `adapter(ctx: AdapterContext) -> Mapping[str, Any]`: `ctx.fields` are the retained field names and
 `ctx.spec` the projection derived for them, to modify and return -- a fresh dict per occurrence. Adapters
 run once per occurrence of the class, including occurrences inside subtrees the projection has to keep
@@ -175,6 +178,11 @@ an excluded key from the inputs it was given. `examples/inspect_adapters.py` hol
   costs more than it saves (see the last benchmark row).
 - **Partial instances:** a model with excluded required fields should not also appear inside a union; the
   serializer warns about the missing fields there.
+- **Migrations that build model instances bypass exclusion.** A before validator that does
+  `data["child"] = Child.model_validate(legacy)` hands pydantic a finished instance, and pydantic does not
+  re-validate one, so the edited validator for `Child` never runs and `Child`'s excluded fields keep the
+  values the migration gave them. Only raw dicts pass through the edited validator. Nothing in the library
+  can intercept this: register no adapter for such a class, or exclude nothing on the class it builds.
 - The pydantic integration relies on the core-schema layout and on `SchemaValidator(..., _use_prebuilt=False)`,
   which pydantic does not promise to keep. CI tests the latest release and pre-release; a `RuntimeError` is
   raised if pydantic-core ignores the schema edit.
@@ -201,7 +209,7 @@ an excluded key from the inputs it was given. `examples/inspect_adapters.py` hol
   the field up under its own name again, so a document that carries the excluded key populates the field
   and the default is not applied. `Projected.validate_json` refuses both flags with `ValueError` whenever
   its projection is incomplete, and forwards them when it is not (the projection stripped alias and name
-  alike). Projection adapters do not affect it: it never reads JSON.
+  alike). Projection adapters do not affect it: it never projects JSON.
 - **Kept-whole subtrees.** The derived projection describes models, lists, sets and variable-length tuples;
   everything else is kept whole -- dict values, unions, fixed tuples, dataclasses, TypedDicts, `Any`, a class
   that appears inside itself, an `extra='allow'` model with no excluded fields of its own, the object named by

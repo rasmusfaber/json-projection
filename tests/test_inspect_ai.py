@@ -23,7 +23,7 @@ except ImportError:  # the read-context helper is private to inspect_ai and may 
 from inspect_ai.log import EvalLog, EvalSample, EvalSpec  # type: ignore  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
-from inspect_adapters import BULK_FIELDS, INSPECT_ADAPTERS  # type: ignore  # noqa: E402
+from inspect_adapters import BULK_FIELDS, INSPECT_ADAPTERS, thin_eval_log  # type: ignore  # noqa: E402
 
 from json_projection.pydantic import Projected, normalize_exclude  # noqa: E402
 from migration_models import retained_dump  # noqa: E402
@@ -70,3 +70,15 @@ def test_the_spec_fallback_survives_excluding_task_args():
     assert thin.eval.task_args == {}  # excluded: default applied, though the key was kept for the migration
     norm = normalize_exclude(EvalLog, exclude)
     assert retained_dump(thin, norm) == retained_dump(plain, norm)
+
+
+def test_excluding_the_results_is_refused_while_samples_are_retained():
+    """`populate_scorer_name_for_samples` renames a legacy score from `results.scores[0].name`."""
+    exclude = {EvalSample: BULK_FIELDS, EvalLog: {"results"}}
+    with pytest.raises(ValueError, match="retaining 'samples' requires 'results'"):
+        Projected(EvalLog, exclude, projection_adapters=INSPECT_ADAPTERS)
+
+
+def test_an_explicit_empty_exclusion_excludes_nothing():
+    assert thin_eval_log({}).exclude == {}
+    assert thin_eval_log().exclude == {EvalSample: BULK_FIELDS}

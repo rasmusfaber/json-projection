@@ -6,7 +6,8 @@ Requires the ``pydantic`` extra: ``pip install 'json-projection[pydantic]'``.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any, Union, cast
 
 try:
@@ -283,15 +284,61 @@ def _field_keys(name: str, alias: Any) -> list[tuple[str, bool]]:
     return list(dict.fromkeys(keys))
 
 
-def _derive_spec(model: type[BaseModel], excluded: dict[type, frozenset[str]]) -> tuple[dict[str, Any], bool]:
+@dataclass(frozen=True)
+class AdapterContext:
+    """What a projection adapter is told about one JSON object.
+
+    `fields` are the declared fields retained after exclusion, by field name. `spec` is the projection
+    derived for them -- keyed by JSON key, aliases applied -- and is a fresh dict the adapter may modify
+    and return.
+    """
+
+    model: type[BaseModel]
+    fields: frozenset[str]
+    spec: dict[str, Any]
+
+
+ProjectionAdapter = Callable[[AdapterContext], Mapping[str, Any]]
+"""Translates the fields retained after validation into the JSON inputs the class's validators need.
+
+Returns the spec for the object in the usual grammar (JSON key -> True | nested mapping | {"__all__": spec}),
+or raises ValueError for an exclusion set the migration cannot support. Called once per occurrence of the
+class in the schema; must be a pure function of its context.
+"""
+
+
+def _adapter_spec(cls: type, result: Any) -> dict[str, Any]:
+    """An adapter's return value as a spec, or `TypeError` naming the class."""
+    if not isinstance(result, Mapping) or not all(isinstance(k, str) for k in result):
+        raise TypeError(
+            f"projection adapter for {cls.__qualname__} returned {type(result).__name__}, "
+            "expected a mapping of JSON keys to specs"
+        )
+    spec = dict(cast("Mapping[str, Any]", result))
+    try:
+        Projection(spec)  # compile now, so a grammar error names the class instead of surfacing later
+    except TypeError as e:
+        raise TypeError(f"projection adapter for {cls.__qualname__} returned an invalid spec: {e}") from e
+    return spec
+
+
+def _derive_spec(
+    model: type[BaseModel],
+    excluded: dict[type, frozenset[str]],
+    adapters: Mapping[type, ProjectionAdapter],
+) -> tuple[dict[str, Any], bool]:
     """The keep-spec for `model` minus `excluded`, and whether it covers every occurrence of every class.
 
     Every shape the derivation cannot describe is kept whole instead: a class that appears inside itself
     (a spec is a finite tree), an `extra='allow'` class with no excluded fields of its own (its
     undeclared keys are data), a before/wrap/plain validator (its input is not the shape its inner
     schema describes), and everything unknown (dicts, unions, fixed tuples, dataclasses, TypedDicts,
-    `Any`, enclosing objects named by a multi-segment alias path, colliding keys). Nothing below a kept
-    subtree is projected, so `complete` is False as soon as an excluded class is reachable in one.
+    `Any`, enclosing objects named by a multi-segment alias path, colliding keys).
+
+    A class with a registered adapter is the exception for before/wrap wrappers: its retained fields are
+    derived as usual and the adapter says what the validator reads; a migration may recreate an excluded
+    key from those inputs, so such a class leaves `complete` False whenever an excluded class is at or
+    below it.
     """
     schema: dict[str, Any] = cast("dict[str, Any]", model.__pydantic_core_schema__)
     definitions = _definitions(schema)
@@ -338,8 +385,11 @@ def _derive_spec(model: type[BaseModel], excluded: dict[type, frozenset[str]]) -
             if _extra(cls) == "allow" and not excluded.get(cls):
                 # undeclared keys are data on this class, so keep the whole object
                 return opaque(node)
+            adapter = adapters.get(cls)
             fields, kind = _fields_node(node, definitions)
-            if kind is not None:
+            if kind is not None and (adapter is None or fields is None):
+                # a before/wrap validator's input is not the shape its fields describe: only an adapter
+                # can say what it reads -- and a plain validator has no fields to retain at all
                 wrapper_kind.append(kind)
                 return opaque(node)
             if fields is None:
@@ -361,7 +411,13 @@ def _derive_spec(model: type[BaseModel], excluded: dict[type, frozenset[str]]) -
                         opaque(source[key])
                     out[key] = value
                     source[key] = fschema
-            return out
+            if adapter is None:
+                return out
+            retained = frozenset(n for n in fields["fields"] if n not in excluded.get(cls, ()))
+            spec = _adapter_spec(cls, adapter(AdapterContext(cls, retained, out)))
+            if _reaches_excluded(node, definitions, excluded):
+                complete[0] = False  # a migration may recreate an excluded key from the inputs it kept
+            return spec
         return opaque(node)  # dict, unions, fixed tuples, dataclasses, TypedDicts, Any, scalars
 
     root = spec_for(schema, frozenset())
@@ -372,17 +428,33 @@ def _derive_spec(model: type[BaseModel], excluded: dict[type, frozenset[str]]) -
                 "of its own fields are excluded; exclude a field on it or use projected_validator alone"
             )
         if wrapper_kind:
+            kind = wrapper_kind[0]
+            hint = (
+                "it replaces validation, so there are no fields to project"
+                if kind == "function-plain"
+                else f"register a projection adapter for {model.__qualname__} (projection_adapters=...) "
+                "to say what it reads"
+            )
             raise TypeError(
-                f"cannot derive a projection for {model.__qualname__}: a {wrapper_kind[0]} validator "
-                "wraps its fields, so the shape of its input is unknown; use projected_validator alone"
+                f"cannot derive a projection for {model.__qualname__}: a {kind} validator wraps its "
+                f"fields, so the shape of its input is unknown; {hint}, or use projected_validator alone"
             )
         raise TypeError(f"{model.__qualname__}: could not derive an object spec from its core schema")
     return root, complete[0]
 
 
-def projection_spec(model: type[BaseModel], exclude: Exclude) -> dict[str, Any]:
-    """Derive the keep-spec for `model` minus the excluded fields from its core schema."""
-    return _derive_spec(model, normalize_exclude(model, exclude))[0]
+def projection_spec(
+    model: type[BaseModel],
+    exclude: Exclude,
+    *,
+    projection_adapters: Mapping[type, ProjectionAdapter] | None = None,
+) -> dict[str, Any]:
+    """Derive the keep-spec for `model` minus the excluded fields from its core schema.
+
+    `projection_adapters` maps classes to adapters that say what their before/wrap validators read
+    (see `ProjectionAdapter` and `migration_adapter`).
+    """
+    return _derive_spec(model, normalize_exclude(model, exclude), dict(projection_adapters or {}))[0]
 
 
 class Projected:
@@ -395,12 +467,23 @@ class Projected:
     inside one still sees its keys, so it must use `extra='ignore'`, and an excluded field with a default
     must not be populated by name; `projected_validator` raises `ValueError` otherwise. `validate_json`
     refuses `by_name=True` and `by_alias=False` for the same reason while `complete` is False.
+
+    Classes behind a ``model_validator(mode='before')`` or ``'wrap'`` are projected only when
+    ``projection_adapters`` holds an adapter for them (see `migration_adapter`); the adapter says which
+    JSON inputs the migration reads. Such classes keep the guards on when exclusion touches them.
     """
 
-    def __init__(self, model: type[BaseModel], exclude: Exclude) -> None:
+    def __init__(
+        self,
+        model: type[BaseModel],
+        exclude: Exclude,
+        *,
+        projection_adapters: Mapping[type, ProjectionAdapter] | None = None,
+    ) -> None:
         self.model = model
         self.exclude = normalize_exclude(model, exclude)
-        spec, self.complete = _derive_spec(model, self.exclude)
+        self.projection_adapters: dict[type, ProjectionAdapter] = dict(projection_adapters or {})
+        spec, self.complete = _derive_spec(model, self.exclude, self.projection_adapters)
         # the guards in projected_validator are only unnecessary when the projection removes every occurrence
         self.validator = projected_validator(model, self.exclude, assume_projected=self.complete)
         self.spec = Projection(spec)
@@ -428,4 +511,6 @@ class Projected:
 
     def __repr__(self) -> str:
         ex = ", ".join(f"{c.__qualname__}: {sorted(n)}" for c, n in self.exclude.items())
-        return f"Projected({self.model.__qualname__}, exclude={{{ex}}})"
+        adapted = ", ".join(c.__qualname__ for c in self.projection_adapters)
+        tail = f", projection_adapters=[{adapted}]" if adapted else ""
+        return f"Projected({self.model.__qualname__}, exclude={{{ex}}}{tail})"

@@ -1,0 +1,130 @@
+"""Projection adapters: projecting through models with migration (before/wrap) validators."""
+
+from typing import Any
+
+import pytest
+from pydantic import BaseModel, ConfigDict, model_validator
+
+from json_projection.pydantic import AdapterContext, Projected, projection_spec
+
+
+class Item(BaseModel):
+    id: int
+    blob: dict[str, Any] = {}
+
+
+class Legacy(BaseModel):
+    """`name` used to be called `old_name`; the before validator renames it."""
+
+    name: str
+    items: list[Item] = []
+    payload: dict[str, Any] = {}
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "old_name" in data:
+            data = dict(data)
+            data["name"] = data.pop("old_name")
+        return data
+
+
+class Holder(BaseModel):
+    legacy: Legacy
+    junk: dict[str, Any] = {}
+
+
+def legacy_adapter(ctx: AdapterContext) -> dict[str, Any]:
+    if "name" in ctx.fields:
+        ctx.spec["old_name"] = True  # the migration reads the legacy key when name is wanted
+    return ctx.spec
+
+
+ADAPTERS = {Legacy: legacy_adapter}
+LEGACY_DOC = b'{"old_name": "n", "items": [{"id": 1, "blob": {"big": [1, 2, 3]}}], "payload": {"big": true}}'
+CURRENT_DOC = b'{"name": "n", "items": [{"id": 1, "blob": {"big": [1, 2, 3]}}], "payload": {"big": true}}'
+
+
+def test_a_root_with_a_before_validator_needs_an_adapter():
+    with pytest.raises(TypeError, match="function-before validator wraps its fields.*projection_adapters"):
+        Projected(Legacy, {"payload"})
+
+
+def test_an_adapter_projects_through_the_validator():
+    assert projection_spec(Legacy, {"payload"}, projection_adapters=ADAPTERS) == {
+        "name": True,
+        "items": {"__all__": {"id": True, "blob": True}},
+        "old_name": True,
+    }
+    thin = Projected(Legacy, {"payload"}, projection_adapters=ADAPTERS)
+    for doc in (LEGACY_DOC, CURRENT_DOC):
+        got = thin.validate_json(doc)
+        assert (got.name, got.items[0].id, got.payload) == ("n", 1, {})
+        assert b"payload" not in thin.spec(doc)
+    assert b"old_name" in thin.spec(LEGACY_DOC)
+
+
+def test_an_adapter_on_a_nested_class():
+    exclude = {Holder: {"junk"}, Legacy: {"payload"}}
+    doc = b'{"legacy": ' + LEGACY_DOC + b', "junk": {"x": 1}}'
+    thin = Projected(Holder, exclude, projection_adapters=ADAPTERS)
+    got = thin.validate_json(doc)
+    assert (got.legacy.name, got.legacy.payload, got.junk) == ("n", {}, {})
+    assert b"payload" not in thin.spec(doc)
+    # without the adapter the nested class is kept whole: still correct, nothing inside it is dropped
+    whole = Projected(Holder, exclude)
+    assert whole.validate_json(doc).legacy.payload == {}
+    assert b"payload" in whole.spec(doc)
+
+
+def test_an_adapter_on_a_class_without_validators_is_applied():
+    def drop_blob(ctx: AdapterContext) -> dict[str, Any]:
+        assert ctx.model is Item and ctx.fields == {"id", "blob"}
+        return {"id": True}
+
+    thin = Projected(Legacy, {"payload"}, projection_adapters={Legacy: legacy_adapter, Item: drop_blob})
+    assert thin.validate_json(CURRENT_DOC).items[0].blob == {}  # never in the bytes; the default applied
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [["name"], {"__all__": True, "name": True}, {1: True}],
+    ids=["not-a-mapping", "all-mixed-with-keys", "non-str-key"],
+)
+def test_malformed_adapter_output_names_the_class(bad: Any):
+    with pytest.raises(TypeError, match="projection adapter for Legacy"):
+        Projected(Legacy, {"payload"}, projection_adapters={Legacy: lambda ctx: bad})
+
+
+def test_an_adapter_may_refuse_an_exclusion_set():
+    def refuse(ctx: AdapterContext) -> dict[str, Any]:
+        raise ValueError("boom: name cannot be derived without payload")
+
+    with pytest.raises(ValueError, match="boom"):
+        Projected(Legacy, {"payload"}, projection_adapters={Legacy: refuse})
+
+
+def test_an_adapted_class_with_exclusions_keeps_the_guards_on():
+    thin = Projected(Legacy, {"payload"}, projection_adapters=ADAPTERS)
+    assert thin.complete is False
+    with pytest.raises(ValueError, match="by name"):
+        thin.validate_json(CURRENT_DOC, by_name=True)
+
+    class Forbid(Legacy):
+        model_config = ConfigDict(extra="forbid")
+
+    with pytest.raises(ValueError, match="extra='forbid'"):
+        Projected(Forbid, {"payload"}, projection_adapters={Forbid: legacy_adapter})
+
+
+def test_an_adapted_class_unrelated_to_exclusions_stays_complete():
+    thin = Projected(Holder, {Holder: {"junk"}}, projection_adapters=ADAPTERS)
+    assert thin.complete is True
+    assert thin.validate_json(b'{"legacy": ' + LEGACY_DOC + b"}").legacy.name == "n"
+
+
+def test_repr_lists_adapted_classes():
+    assert "projection_adapters=[Legacy]" in repr(
+        Projected(Legacy, {"payload"}, projection_adapters=ADAPTERS)
+    )
+    assert "projection_adapters" not in repr(Projected(Holder, {Holder: {"junk"}}))

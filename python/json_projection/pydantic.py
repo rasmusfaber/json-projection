@@ -137,15 +137,32 @@ def _fields_node(
     return None, opaque_kind
 
 
+def _own_model_validators(cls: type) -> set[int]:
+    """The identity of every function registered as a model validator of `cls`.
+
+    `@classmethod`, `@staticmethod` and inherited validators all land here: the function the core schema
+    carries is the decorator's `func` (bound or not), so comparing both after unwrapping `__func__`
+    identifies the class's own validators and nothing else.
+    """
+    decorators = getattr(cls, "__pydantic_decorators__", None)
+    validators = getattr(decorators, "model_validators", {})
+    return {id(getattr(d.func, "__func__", d.func)) for d in validators.values()}
+
+
 def _adapted_model_behind(
     node: dict[str, Any], definitions: dict[str, dict[str, Any]], adapters: Mapping[type, ProjectionAdapter]
-) -> dict[str, Any] | None:
-    """The `model` node behind `node`'s outer wrappers, when its class has an adapter that vouches for them.
+) -> tuple[dict[str, Any] | None, bool]:
+    """The `model` node behind `node`'s outer wrappers when its class has an adapter, and whether the
+    adapter vouches for those wrappers.
 
-    A class-level wrap validator wraps the model node from outside, and its function is bound to the
-    class. A validator that belongs to something else -- a field validator on the enclosing model, an
-    `Annotated` validator -- is bound to another class or to nothing, and the adapter knows nothing about
-    it, so the node stays opaque.
+    A class-level wrap validator wraps the model node from outside, and the adapter speaks for it. A
+    validator that belongs to something else -- a field validator on the enclosing model, an `Annotated`
+    validator, even one that is a bound method of this very class -- is not registered on it, so the
+    adapter knows nothing about what it reads and the node stays opaque. Ownership is registration, not
+    binding: the wrapper's function must be one of the class's own model validators.
+
+    Returns `(None, False)` when there is no adapted model behind the wrappers, and `(node, False)` when
+    there is one but a wrapper is not the class's own.
     """
     functions: list[Any] = []
     n: Any = node
@@ -153,18 +170,19 @@ def _adapted_model_behind(
         t = n.get("type")
         if t == "model":
             cls = n["cls"]
-            if cls in adapters and all(getattr(fn, "__self__", None) is cls for fn in functions):
-                return n
-            return None
+            if cls not in adapters:
+                return None, False
+            own = _own_model_validators(cls)
+            return n, all(id(getattr(fn, "__func__", fn)) in own for fn in functions)
         if t in _OPAQUE_WRAPPERS:
             functions.append(n.get("function", {}).get("function"))
         elif t == "definition-ref":
             n = definitions.get(n.get("schema_ref", ""))
             continue
         elif t not in _WRAPPERS:
-            return None
+            return None, False
         n = n.get("schema")
-    return None
+    return None, False
 
 
 def _reaches_excluded(
@@ -446,12 +464,14 @@ def _derive_spec(
     A class with a registered adapter is the exception for before/wrap wrappers: its retained fields are
     derived as usual and the adapter says what the validator reads; a migration may recreate an excluded
     key from those inputs, so such a class leaves `complete` False whenever an excluded class is at or
-    below it.
+    below it. The adapter speaks only for the class's own registered model validators (see
+    `_adapted_model_behind`); any other wrapper keeps the class opaque.
     """
     schema: dict[str, Any] = cast("dict[str, Any]", model.__pydantic_core_schema__)
     definitions = _definitions(schema)
     complete = [True]
     wrapper_kind: list[str] = []
+    foreign: list[tuple[str, type]] = []  # (wrapper kind, adapted class) for wrappers it does not own
 
     def opaque(node: dict[str, Any]) -> bool:
         """Keep this subtree whole, and say so: `True`.
@@ -471,11 +491,12 @@ def _derive_spec(
             target = definitions.get(node["schema_ref"])
             return opaque(node) if target is None else spec_for(target, seen)
         if t in _OPAQUE_WRAPPERS:
-            behind = _adapted_model_behind(node, definitions, adapters)
+            behind, owned = _adapted_model_behind(node, definitions, adapters)
+            if owned and behind is not None:
+                # one of the class's own registered model validators; its adapter says what it reads
+                return spec_for(behind, seen)
             if behind is not None:
-                return spec_for(
-                    behind, seen
-                )  # the class's own wrap validator; its adapter says what it reads
+                foreign.append((t, behind["cls"]))  # adapted, but this wrapper is somebody else's
             wrapper_kind.append(t)
             return opaque(node)
         if t in ("nullable", "default", "function-after"):
@@ -540,6 +561,13 @@ def _derive_spec(
                 f"cannot derive a projection for {model.__qualname__}: it allows extra fields and none "
                 "of its own fields are excluded; exclude a field on it or use projected_validator alone"
             )
+        if foreign:
+            kind, cls = foreign[0]
+            raise TypeError(
+                f"cannot derive a projection for {model.__qualname__}: a {kind} validator that is not "
+                f"one of {cls.__qualname__}'s own model validators wraps it, so the adapter for "
+                f"{cls.__qualname__} cannot vouch for what it reads; use projected_validator alone"
+            )
         if wrapper_kind:
             kind = wrapper_kind[0]
             hint = (
@@ -583,7 +611,10 @@ class Projected:
 
     Classes behind a ``model_validator(mode='before')`` or ``'wrap'`` are projected only when
     ``projection_adapters`` holds an adapter for them (see `migration_adapter`); the adapter says which
-    JSON inputs the migration reads. Such classes keep the guards on when exclusion touches them.
+    JSON inputs the migration reads. An adapter vouches only for the class's own registered model
+    validators: a validator installed from outside -- a field validator on the enclosing model, an
+    ``Annotated`` validator, even one that is a bound method of the adapted class -- keeps the class
+    opaque. Such classes keep the guards on when exclusion touches them.
     """
 
     def __init__(

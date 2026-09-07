@@ -131,10 +131,14 @@ opaque fallback:
    (`function-wrap -> model -> function-before -> model-fields`, for a class with both a wrap and a
    before validator), not inside it like `mode='before'`. So the derivation also looks through outer
    `function-wrap`/`function-before` wrappers to a `model` node beneath them when that class has an
-   adapter and every wrapper passed on the way is a function bound to that class (`fn.__self__ is cls`):
-   the adapter vouches for those too. A validator that belongs to something else -- a field validator on
-   the enclosing model, an `Annotated` validator -- is bound to another class or to nothing, and stays
-   opaque.
+   adapter and every wrapper passed on the way is one of the class's *own registered model validators*
+   -- its function, unwrapped through `__func__`, is the `func` of an entry in
+   `cls.__pydantic_decorators__.model_validators`, which covers `@classmethod`, `@staticmethod` and
+   inherited validators alike: the adapter vouches for those too. Ownership is registration, not
+   binding. A validator that belongs to something else -- a field validator on the enclosing model, an
+   `Annotated` validator, even one that is a bound method of the adapted class -- is registered on
+   nothing, and stays opaque. At the root such a wrapper raises `TypeError` naming the class and saying
+   the adapter cannot vouch for the wrapper, instead of asking for an adapter that is already there.
 3. With an adapter, find the `model-fields` node through the wrappers, ignoring their kind (the adapter
    vouches for what the validator reads). A class with no fields node (a `RootModel`) is still opaque:
    an adapter cannot help there.

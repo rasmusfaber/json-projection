@@ -1,10 +1,11 @@
 """Projection adapters: projecting through models with migration (before/wrap) validators."""
 
 import json
-from typing import Any
+from typing import Annotated, Any
 
 import pytest
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, field_validator, model_validator
+from pydantic_core import core_schema
 
 from json_projection.pydantic import AdapterContext, Projected, _keep_path, migration_adapter, projection_spec
 from migration_models import ADAPTERS as MIGRATION_ADAPTERS
@@ -230,3 +231,62 @@ def test_legacy_inputs_reach_the_migration():
     assert got.scores == plain.scores == {"legacy": 0.5}
     assert got.events == plain.events and got.attachments == plain.attachments == {"k": "v"}
     assert got.timelines == plain.timelines and got.store == {}
+
+
+class Child(BaseModel):
+    """`unpack` is a classmethod of this class, but not one of its model validators."""
+
+    x: int
+
+    @classmethod
+    def unpack(cls, data: Any) -> Any:
+        return data["inner"]
+
+
+class Outer(BaseModel):
+    child: Annotated[Child, BeforeValidator(Child.unpack)]
+
+
+def test_a_bound_classmethod_used_as_an_annotated_validator_is_not_the_class_s_own():
+    """Bound to `Child`, but registered on nothing: the adapter for `Child` cannot vouch for it."""
+    raw = b'{"child": {"inner": {"x": 7}}}'
+    thin = Projected(Outer, {}, projection_adapters={Child: migration_adapter()})
+    assert b"inner" in thin.spec(raw)
+    assert thin.validate_json(raw).child.x == Outer.model_validate_json(raw).child.x == 7
+
+
+class StaticWrapped(BaseModel):
+    """A `staticmethod` model validator is unbound, and still the class's own."""
+
+    name: str = ""
+    junk: dict[str, Any] = {}
+
+    @model_validator(mode="wrap")  # pyright: ignore[reportArgumentType]  (a staticmethod validator takes no cls)
+    @staticmethod
+    def wrap(data: Any, handler: Any) -> Any:
+        return handler(data)
+
+
+def test_a_staticmethod_wrap_validator_is_projected_through():
+    thin = Projected(StaticWrapped, {"junk"}, projection_adapters={StaticWrapped: migration_adapter()})
+    assert thin.spec(b'{"name": "a", "junk": {"big": [1, 2]}}') == b'{"name": "a"}'
+
+
+def _unpack(data: Any) -> Any:
+    return data["inner"]
+
+
+class ForeignWrapped(BaseModel):
+    """A before validator installed around the whole class by something other than a model validator."""
+
+    x: int = 0
+    junk: dict[str, Any] = {}
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source: Any, handler: Any) -> Any:
+        return core_schema.no_info_before_validator_function(_unpack, handler(source))
+
+
+def test_a_foreign_wrapper_at_the_root_says_so_instead_of_asking_for_an_adapter():
+    with pytest.raises(TypeError, match="not one of ForeignWrapped's own model validators"):
+        Projected(ForeignWrapped, {"junk"}, projection_adapters={ForeignWrapped: migration_adapter()})

@@ -158,6 +158,13 @@ opaque fallback:
 `function-plain` stays opaque even with an adapter: it replaces validation entirely, so there are no
 fields to retain.
 
+Every kept-whole subtree is still searched for adapted classes (following each `definition-ref` once,
+and skipping classes the derivation is already inside), and each one found is derived once and the
+result discarded. Keeping the bytes whole answers "what survives projection", not "can this migration
+live with these exclusions": an adapter's `requires` conflict, unknown field name or hand-written
+refusal must be reported wherever its class occurs, not only where the projection reaches. The discarded
+derivation cannot add keys to the spec; it can only make `complete` more conservative.
+
 An input path or control that names an excluded field's key re-adds that key to the JSON. The field is
 still excluded from the result by the schema edit (popped if required, defaulted through the alias
 redirect otherwise); the config guards handle `extra='forbid'`/`'allow'` and by-name classes because the

@@ -482,14 +482,27 @@ def _derive_spec(
     wrapper_kind: list[str] = []
     foreign: list[tuple[str, type]] = []  # (wrapper kind, adapted class) for wrappers it does not own
 
-    def opaque(node: dict[str, Any]) -> bool:
+    def opaque(node: dict[str, Any], seen: frozenset[type]) -> bool:
         """Keep this subtree whole, and say so: `True`.
 
         Every fallback goes through here. Below a kept subtree nothing is projected, so an excluded
         class reachable in it keeps its keys and the derivation is no longer complete.
+
+        Adapted classes in the subtree are still derived, once per class, and the result thrown away.
+        An adapter has to see every occurrence of its class: keeping the bytes whole answers "what
+        survives projection", not "can this migration live with these exclusions", and a `requires`
+        conflict or a misspelt field name must be reported wherever the class appears, not only where
+        the projection happens to reach. `seen` stops the derivation from re-entering a class it is
+        already inside.
         """
         if _reaches_excluded(node, definitions, excluded):
             complete[0] = False
+        derived: set[type] = set()
+        for model_node in _subtree_models(node, definitions):
+            cls = model_node["cls"]
+            if cls in adapters and cls not in seen and cls not in derived:
+                derived.add(cls)
+                spec_for(model_node, seen)
         return True
 
     def spec_for(node: dict[str, Any], seen: frozenset[type]) -> Any:
@@ -498,7 +511,7 @@ def _derive_spec(
             return spec_for(node["schema"], seen)
         if t == "definition-ref":
             target = definitions.get(node["schema_ref"])
-            return opaque(node) if target is None else spec_for(target, seen)
+            return opaque(node, seen) if target is None else spec_for(target, seen)
         if t in _OPAQUE_WRAPPERS:
             behind, owned = _adapted_model_behind(node, definitions, adapters)
             if owned and behind is not None:
@@ -507,13 +520,15 @@ def _derive_spec(
             if behind is not None:
                 foreign.append((t, behind["cls"]))  # adapted, but this wrapper is somebody else's
             wrapper_kind.append(t)
-            return opaque(node)
+            return opaque(node, seen)
         if t in ("nullable", "default", "function-after"):
             # function-after runs on what the inner schema already validated, so that shape is known
-            return spec_for(node["schema"], seen) if isinstance(node.get("schema"), dict) else opaque(node)
+            return (
+                spec_for(node["schema"], seen) if isinstance(node.get("schema"), dict) else opaque(node, seen)
+            )
         if t in ("list", "set", "frozenset"):
             if not isinstance(node.get("items_schema"), dict):
-                return opaque(node)
+                return opaque(node, seen)
             return {"__all__": spec_for(node["items_schema"], seen)}
         if (
             t == "tuple"
@@ -523,35 +538,36 @@ def _derive_spec(
             return {"__all__": spec_for(node["items_schema"][0], seen)}  # tuple[X, ...]
         if t == "model":
             cls = node["cls"]
+            inner = seen | {cls}  # a fallback on this class must not derive it again
             if cls in seen:
-                return opaque(node)  # a class inside itself; a spec is a finite tree
+                return opaque(node, inner)  # a class inside itself; a spec is a finite tree
             if _extra(cls) == "allow" and not excluded.get(cls):
                 # undeclared keys are data on this class, so keep the whole object
-                return opaque(node)
+                return opaque(node, inner)
             adapter = adapters.get(cls)
             fields, kind = _fields_node(node, definitions)
             if kind is not None and (adapter is None or fields is None):
                 # a before/wrap validator's input is not the shape its fields describe: only an adapter
                 # can say what it reads -- and a plain validator has no fields to retain at all
                 wrapper_kind.append(kind)
-                return opaque(node)
+                return opaque(node, inner)
             if fields is None:
-                return opaque(node)
+                return opaque(node, inner)
             out: dict[str, Any] = {}
             source: dict[str, dict[str, Any]] = {}  # the field schema each kept key came from
             for name, field in fields["fields"].items():
                 if name in excluded.get(cls, ()):
                     continue
                 fschema = field["schema"]
-                sub = spec_for(fschema, seen | {cls})
+                sub = spec_for(fschema, inner)
                 for key, direct in _field_keys(name, field.get("validation_alias")):
                     # a multi-segment alias path names an enclosing object, not the field's own value
-                    value = sub if direct else opaque(fschema)
+                    value = sub if direct else opaque(fschema, inner)
                     if out.get(key, value) != value:
                         # two fields under one JSON key describe it differently: keep it whole
                         value = True
-                        opaque(fschema)
-                        opaque(source[key])
+                        opaque(fschema, inner)
+                        opaque(source[key], inner)
                     out[key] = value
                     source[key] = fschema
             if adapter is None:
@@ -561,7 +577,7 @@ def _derive_spec(
             if _reaches_excluded(node, definitions, excluded):
                 complete[0] = False  # a migration may recreate an excluded key from the inputs it kept
             return spec
-        return opaque(node)  # dict, unions, fixed tuples, dataclasses, TypedDicts, Any, scalars
+        return opaque(node, seen)  # dict, unions, fixed tuples, dataclasses, TypedDicts, Any, scalars
 
     root = spec_for(schema, frozenset())
     in_schema = {n["cls"] for n in _subtree_models(schema, definitions)}

@@ -1,10 +1,17 @@
 """Projection adapters: projecting through models with migration (before/wrap) validators."""
 
 import json
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal, Union
 
 import pytest
-from pydantic import BaseModel, BeforeValidator, ConfigDict, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 from pydantic_core import core_schema
 
 from json_projection.pydantic import AdapterContext, Projected, _keep_path, migration_adapter, projection_spec
@@ -316,3 +323,46 @@ def test_an_adapter_is_looked_up_by_exact_class():
     assert projection_spec(SubHolder, {Sub: {"b"}}, projection_adapters={Sub: control}) == {
         "sub": {"a": True, "ctl": True}
     }
+
+
+class Tagged(BaseModel):
+    """Adapted, and reachable only inside a discriminated union, which the derivation keeps whole."""
+
+    tag: Literal["a"] = "a"
+    values: list[int] = []
+    total: int = 0
+    junk: dict[str, Any] = {}
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def calculate(cls, data: Any, handler: Any) -> Any:
+        obj = handler(data)
+        obj.total = sum(obj.values)
+        return obj
+
+
+class Untagged(BaseModel):
+    tag: Literal["b"] = "b"
+
+
+class Union2(BaseModel):
+    item: Annotated[Union[Tagged, Untagged], Field(discriminator="tag")]
+
+
+def test_an_adapter_inside_a_kept_whole_subtree_still_refuses_a_conflict():
+    """Keeping the bytes whole does not make the migration able to live with the exclusion."""
+    adapters = {Tagged: migration_adapter(requires={"total": ["values"]})}
+    with pytest.raises(ValueError, match="retaining 'total' requires 'values'"):
+        Projected(Union2, {Tagged: {"values"}}, projection_adapters=adapters)
+    with pytest.raises(ValueError, match="retaining 'total' requires 'values'"):
+        Projected(Tagged, {"values"}, projection_adapters=adapters)
+
+
+def test_a_non_conflicting_adapter_inside_a_union_still_validates():
+    raw = b'{"item": {"tag": "a", "values": [2, 3], "junk": {"big": [1]}}}'
+    adapters = {Tagged: migration_adapter(requires={"total": ["values"]})}
+    thin = Projected(Union2, {Tagged: {"junk"}}, projection_adapters=adapters)
+    assert thin.spec(raw) == raw  # the union is kept whole; the discarded derivation changes nothing
+    item = thin.validate_json(raw).item
+    assert isinstance(item, Tagged)
+    assert item.total == 5 and item.junk == {}  # the migration ran on everything it needs

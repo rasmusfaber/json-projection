@@ -78,7 +78,11 @@ set means the root model.
   projection keeps only declared fields.
 - **Standalone `projected_validator`.** Excluded fields with a default are redirected to the alias
   `\x00excluded:<name>`; a document that contains that literal key still populates the field. `Projected`
-  strips it.
+  strips it. Validating with `by_name=True` or `by_alias=False` on the returned `SchemaValidator` looks
+  the field up under its own name again, so a document that carries the excluded key populates the field
+  and the default is not applied. `Projected.validate_json` refuses both flags with `ValueError` whenever
+  its projection is incomplete, and forwards them when it is not (the projection stripped alias and name
+  alike).
 - **Kept-whole subtrees.** The derived projection describes models, lists, sets and variable-length tuples;
   everything else is kept whole -- dict values, unions, fixed tuples, dataclasses, TypedDicts, `Any`, a class
   that appears inside itself, an `extra='allow'` model with no excluded fields of its own, the object named by

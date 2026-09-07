@@ -393,15 +393,16 @@ class Projected:
 
     The projection keeps whole every subtree it cannot describe (see `_derive_spec`). An excluded class
     inside one still sees its keys, so it must use `extra='ignore'`, and an excluded field with a default
-    must not be populated by name; `projected_validator` raises `ValueError` otherwise.
+    must not be populated by name; `projected_validator` raises `ValueError` otherwise. `validate_json`
+    refuses `by_name=True` and `by_alias=False` for the same reason while `complete` is False.
     """
 
     def __init__(self, model: type[BaseModel], exclude: Exclude) -> None:
         self.model = model
         self.exclude = normalize_exclude(model, exclude)
-        spec, complete = _derive_spec(model, self.exclude)
+        spec, self.complete = _derive_spec(model, self.exclude)
         # the guards in projected_validator are only unnecessary when the projection removes every occurrence
-        self.validator = projected_validator(model, self.exclude, assume_projected=complete)
+        self.validator = projected_validator(model, self.exclude, assume_projected=self.complete)
         self.spec = Projection(spec)
 
     def validate_json(
@@ -413,6 +414,14 @@ class Projected:
         by_alias: bool | None = None,
         by_name: bool | None = None,
     ) -> Any:
+        if not self.complete and (by_name or by_alias is False):
+            # an excluded field with a default keeps its key inside every subtree the projection had to
+            # keep whole; validating by name reads it there and the default is never applied
+            raise ValueError(
+                f"{self.model.__qualname__}: the projection could not remove every excluded key (it "
+                "keeps some subtrees whole), so validating by name would read the excluded keys that "
+                "are left. Drop by_name/by_alias, or exclude nothing inside those subtrees."
+            )
         return self.validator.validate_json(
             self.spec(data), strict=strict, context=context, by_alias=by_alias, by_name=by_name
         )

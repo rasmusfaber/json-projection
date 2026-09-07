@@ -1,8 +1,10 @@
 """Projection adapters: projecting through models with migration (before/wrap) validators."""
 
+import functools
 import json
 import time
-from collections import Counter
+from collections import Counter, UserDict
+from types import MappingProxyType
 from typing import Annotated, Any, Literal, Optional, Union
 
 import pytest
@@ -19,6 +21,7 @@ from pydantic import (
 from pydantic_core import core_schema
 
 import json_projection.pydantic
+from json_projection import Projection
 from json_projection.pydantic import AdapterContext, Projected, _keep_path, migration_adapter, projection_spec
 from migration_models import ADAPTERS as MIGRATION_ADAPTERS
 from migration_models import SAMPLE_ADAPTER, Item, Log, Sample
@@ -708,3 +711,60 @@ def test_a_generator_returned_by_an_adapter_is_consumed_once():
         KidHolder, {"junk"}, projection_adapters={KidHolder: lambda ctx: {"children": {"__all__": once()}}}
     )
     assert consumed == [1]
+
+
+class MappingProtocol:
+    """Only `keys()` and indexing -- exactly what the compiler accepts as a mapping."""
+
+    def __init__(self, values: dict[str, Any]) -> None:
+        self.values = values
+
+    def keys(self) -> Any:
+        return self.values.keys()
+
+    def __getitem__(self, key: str) -> Any:
+        return self.values[key]
+
+
+PROTOCOL_SPECS: dict[str, Any] = {
+    "protocol-object": lambda: {"children": MappingProtocol({"__all__": iter(["x"])})},
+    "mapping-proxy": lambda: {"children": MappingProxyType({"__all__": iter(["x"])})},
+    "user-dict": lambda: {"children": UserDict({"__all__": iter(["x"])})},
+}
+
+
+@pytest.mark.parametrize("shape", list(PROTOCOL_SPECS), ids=list(PROTOCOL_SPECS))
+def test_a_lazy_value_inside_a_mapping_protocol_object_is_materialised(shape: str):
+    """Anything the compiler reads as a mapping has to be walked, not just a `Mapping` subclass."""
+    thin = Projected(
+        KidHolder, {"junk"}, projection_adapters={KidHolder: lambda ctx: PROTOCOL_SPECS[shape]()}
+    )
+    assert thin.spec(KID_DOC) == b'{"children": [{"x": 7}]}'
+    assert thin.validate_json(KID_DOC).children[0].x == 7
+
+
+def test_a_self_referential_adapter_output_is_refused():
+    cyclic: dict[str, Any] = {}
+    cyclic["children"] = cyclic
+    with pytest.raises(TypeError, match="projection adapter for KidHolder.*contains itself"):
+        Projected(KidHolder, {"junk"}, projection_adapters={KidHolder: lambda ctx: cyclic})
+
+
+def _nest(levels: int) -> Any:
+    return functools.reduce(lambda inner, _: {"k": inner}, range(levels), True)
+
+
+def test_an_adapter_output_deeper_than_the_compiler_allows_is_refused():
+    deep = {"children": _nest(2256)}
+    with pytest.raises(TypeError, match="projection adapter for KidHolder.*nesting exceeds 256 levels"):
+        Projected(KidHolder, {"junk"}, projection_adapters={KidHolder: lambda ctx: deep})
+
+
+def test_the_deepest_output_the_compiler_accepts_still_compiles():
+    """The root mapping is level 0, so 255 more levels under a key is the compiler's exact limit."""
+    assert Projection(_nest(256)) is not None  # the bound `_materialise` matches
+    with pytest.raises(TypeError, match="nesting exceeds 256 levels"):
+        Projection(_nest(257))
+    at_limit = {"children": _nest(255)}  # the root mapping plus 255 more levels
+    thin = Projected(KidHolder, {"junk"}, projection_adapters={KidHolder: lambda ctx: at_limit})
+    assert thin.spec(KID_DOC).startswith(b'{"children"')  # materialised and compiled, both times

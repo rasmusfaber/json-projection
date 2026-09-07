@@ -395,33 +395,66 @@ class in the schema; must be a pure function of its context.
 """
 
 
-def _materialise(cls: type, value: Any) -> Any:
+_MAX_SPEC_DEPTH = 256
+"""The compiler's nesting cap (`MAX_DEPTH` in `src/spec.rs`), counted the same way it counts."""
+
+
+def _is_spec_mapping(value: Any) -> bool:
+    """Whether the compiler will read `value` as a mapping.
+
+    It accepts more than `Mapping`: anything with `keys()` that can be indexed is copied through a
+    `dict`, so `MappingProxyType`, `UserDict` and any hand-rolled mapping protocol object qualify.
+    Materialisation has to recognise exactly what the compiler recognises, or a lazy value nested in
+    one of those escapes it.
+    """
+    return isinstance(value, Mapping) or (hasattr(value, "keys") and hasattr(value, "__getitem__"))
+
+
+def _materialise(cls: type, value: Any, depth: int, seen: frozenset[int]) -> Any:
     """A spec with every lazy iterable in it spent, exactly once.
 
     An adapter's output is compiled twice -- once here to validate it, once with the rest of the
     projection -- so a generator or iterator left inside would come back empty the second time and its
     keys would be dropped from the bytes without a word.
+
+    `depth` and `seen` (the `id()` of every container on the path here) stand in for the bounds the
+    compiler would have applied: without them a cyclic or absurdly deep output raises `RecursionError`
+    from this walk instead of the compiler's own message.
     """
-    if isinstance(value, Mapping):
-        if not all(isinstance(k, str) for k in value):
-            raise TypeError(
-                f"projection adapter for {cls.__qualname__} returned a mapping with non-str keys, "
-                "expected a mapping of JSON keys to specs"
-            )
-        return {k: _materialise(cls, v) for k, v in cast("Mapping[str, Any]", value).items()}
-    if isinstance(value, (bool, str)) or not isinstance(value, Iterable):
+
+    def invalid(what: str) -> TypeError:
+        return TypeError(f"projection adapter for {cls.__qualname__} returned an invalid spec: {what}")
+
+    if depth > _MAX_SPEC_DEPTH:
+        raise invalid(f"nesting exceeds {_MAX_SPEC_DEPTH} levels")
+    mapping = _is_spec_mapping(value)
+    if not mapping and (isinstance(value, (bool, str)) or not isinstance(value, Iterable)):
         return value  # a `str` is iterable but is a leaf here; the compile rejects it where invalid
-    return [_materialise(cls, item) for item in value]
+    if id(value) in seen:
+        raise invalid("it contains itself")
+    inner = seen | {id(value)}
+    if mapping:
+        source = cast("Mapping[Any, Any]", value)  # duck-typed too: only keys() and indexing are used
+        out: dict[str, Any] = {}
+        for key in source.keys():  # noqa: SIM118  (a protocol object need not be iterable itself)
+            if not isinstance(key, str):
+                raise TypeError(
+                    f"projection adapter for {cls.__qualname__} returned a mapping with non-str keys, "
+                    "expected a mapping of JSON keys to specs"
+                )
+            out[key] = _materialise(cls, source[key], depth + 1, inner)
+        return out
+    return [_materialise(cls, item, depth + 1, inner) for item in value]
 
 
 def _adapter_spec(cls: type, result: Any) -> dict[str, Any]:
     """An adapter's return value as a spec, or `TypeError` naming the class."""
-    if not isinstance(result, Mapping):
+    if not _is_spec_mapping(result):
         raise TypeError(
             f"projection adapter for {cls.__qualname__} returned {type(result).__name__}, "
             "expected a mapping of JSON keys to specs"
         )
-    spec = cast("dict[str, Any]", _materialise(cls, result))
+    spec = cast("dict[str, Any]", _materialise(cls, result, 0, frozenset()))
     try:
         Projection(spec)  # compile now, so a grammar error names the class instead of surfacing later
     except TypeError as e:

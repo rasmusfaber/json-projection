@@ -165,8 +165,14 @@ opaque fallback:
    returned. It is materialised deeply first -- mappings become dicts (`str` keys checked at every
    level), `bool` and `str` stay, any other iterable becomes a list of materialised items -- because it
    is compiled twice, once with `Projection(result)` to validate the grammar and once with the rest of
-   the projection, and a generator or iterator left inside would come back empty the second time. A
-   compile error is re-raised as `TypeError` prefixed with the class name.
+   the projection, and a generator or iterator left inside would come back empty the second time.
+   "Mapping" here is the compiler's own test -- a `Mapping`, or anything with `keys()` that can be
+   indexed, which is what `src/spec.rs` copies through a `dict` -- so a lazy value nested in a
+   `MappingProxyType`, a `UserDict` or a hand-rolled protocol object is materialised too. The walk
+   carries the compiler's bounds with it: past `MAX_DEPTH` (256, counted as `src/spec.rs` counts) or on
+   a container that contains itself it raises the class-named `TypeError` the compiler would have
+   raised, instead of a `RecursionError` from the walk. A compile error is re-raised as `TypeError`
+   prefixed with the class name.
 6. The result replaces the derived spec for this object. Keys the adapter added are kept as it said; keys it
    removed are dropped; the excluded fields remain absent unless an input path or control re-adds their key.
 7. Completeness: the class marks the derivation incomplete when it has excluded fields of its own or when

@@ -3,7 +3,7 @@
 from typing import Any
 
 import pytest
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from json_projection.pydantic import AdapterContext, Projected, projection_spec
 
@@ -32,6 +32,21 @@ class Legacy(BaseModel):
 class Holder(BaseModel):
     legacy: Legacy
     junk: dict[str, Any] = {}
+
+
+class FieldValidated(BaseModel):
+    """A before validator on the FIELD belongs to this class, not to Legacy.
+
+    Legacy's adapter cannot vouch for it.
+    """
+
+    legacy: Legacy
+    junk: dict[str, Any] = {}
+
+    @field_validator("legacy", mode="before")
+    @classmethod
+    def unwrap(cls, value: Any) -> Any:
+        return value["inner"] if isinstance(value, dict) and "inner" in value else value
 
 
 def legacy_adapter(ctx: AdapterContext) -> dict[str, Any]:
@@ -128,3 +143,16 @@ def test_repr_lists_adapted_classes():
         Projected(Legacy, {"payload"}, projection_adapters=ADAPTERS)
     )
     assert "projection_adapters" not in repr(Projected(Holder, {Holder: {"junk"}}))
+
+
+def test_a_field_validator_on_an_adapted_class_stays_opaque():
+    doc = b'{"legacy": {"inner": ' + LEGACY_DOC + b'}, "junk": {"x": 1}}'
+    thin = Projected(
+        FieldValidated, {FieldValidated: {"junk"}, Legacy: {"payload"}}, projection_adapters=ADAPTERS
+    )
+    assert (
+        thin.complete is False
+    )  # Legacy is kept whole behind the field validator, so its exclusion is not stripped
+    got = thin.validate_json(doc)
+    assert (got.legacy.name, got.legacy.payload, got.junk) == ("n", {}, {})
+    assert b"inner" in thin.spec(doc) and b"payload" in thin.spec(doc)

@@ -137,6 +137,36 @@ def _fields_node(
     return None, opaque_kind
 
 
+def _adapted_model_behind(
+    node: dict[str, Any], definitions: dict[str, dict[str, Any]], adapters: Mapping[type, ProjectionAdapter]
+) -> dict[str, Any] | None:
+    """The `model` node behind `node`'s outer wrappers, when its class has an adapter that vouches for them.
+
+    A class-level wrap validator wraps the model node from outside, and its function is bound to the
+    class. A validator that belongs to something else -- a field validator on the enclosing model, an
+    `Annotated` validator -- is bound to another class or to nothing, and the adapter knows nothing about
+    it, so the node stays opaque.
+    """
+    functions: list[Any] = []
+    n: Any = node
+    while isinstance(n, dict):
+        t = n.get("type")
+        if t == "model":
+            cls = n["cls"]
+            if cls in adapters and all(getattr(fn, "__self__", None) is cls for fn in functions):
+                return n
+            return None
+        if t in _OPAQUE_WRAPPERS:
+            functions.append(n.get("function", {}).get("function"))
+        elif t == "definition-ref":
+            n = definitions.get(n.get("schema_ref", ""))
+            continue
+        elif t not in _WRAPPERS:
+            return None
+        n = n.get("schema")
+    return None
+
+
 def _reaches_excluded(
     node: dict[str, Any], definitions: dict[str, dict[str, Any]], excluded: dict[type, frozenset[str]]
 ) -> bool:
@@ -363,6 +393,11 @@ def _derive_spec(
             target = definitions.get(node["schema_ref"])
             return opaque(node) if target is None else spec_for(target, seen)
         if t in _OPAQUE_WRAPPERS:
+            behind = _adapted_model_behind(node, definitions, adapters)
+            if behind is not None:
+                return spec_for(
+                    behind, seen
+                )  # the class's own wrap validator; its adapter says what it reads
             wrapper_kind.append(t)
             return opaque(node)
         if t in ("nullable", "default", "function-after"):

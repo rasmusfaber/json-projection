@@ -37,17 +37,31 @@ def normalize_exclude(model: type[BaseModel], exclude: Exclude) -> dict[type, fr
 
 
 _DATA_KEYS = frozenset({"default", "metadata", "serialization", "json_schema_extra"})
-"""Keys whose values are user data or output-side settings, not schemas to descend into.
+"""Keys of a schema NODE whose values are user data or output-side settings, not schemas.
 
 A field default is arbitrary Python: it may be a dict that happens to look like a schema node, and it
-may even contain itself. Neither traversal has any business inside one.
+may even contain itself. Neither traversal has any business inside one. These are node keys only: the
+same strings are perfectly ordinary field names, TypedDict keys and union tags, and the maps that hold
+those (`model-fields.fields`, a tagged union's `choices`) must be descended into whole.
 """
+
+
+def _is_node(d: dict[Any, Any]) -> bool:
+    """Whether `d` is a schema node rather than a name -> schema map.
+
+    Every core-schema node carries its kind under a string `type`. A map keyed by field name, TypedDict
+    key or union tag holds schemas (or tag aliases) as its values, so it has no such key -- and a field
+    genuinely named `type` maps to a schema, not to a string.
+    """
+    return isinstance(d.get("type"), str)
 
 
 def _copy(node: Any) -> Any:
     """Structural copy along schema edges; leaves (classes, functions) and `_DATA_KEYS` are shared."""
     if isinstance(node, dict):
-        return {k: v if k in _DATA_KEYS else _copy(v) for k, v in node.items()}
+        if _is_node(node):
+            return {k: v if k in _DATA_KEYS else _copy(v) for k, v in node.items()}
+        return {k: _copy(v) for k, v in node.items()}  # a name -> schema map: every value is a schema
     if isinstance(node, list):
         return [_copy(v) for v in node]
     if isinstance(node, tuple):  # a tagged union's (schema, tag) choices
@@ -58,9 +72,13 @@ def _copy(node: Any) -> Any:
 def _walk(node: Any, fn: Any) -> None:
     """Call `fn` on every schema node reachable along schema edges."""
     if isinstance(node, dict):
-        fn(node)
-        for k, v in node.items():
-            if k not in _DATA_KEYS:
+        if _is_node(node):
+            fn(node)
+            for k, v in node.items():
+                if k not in _DATA_KEYS:
+                    _walk(v, fn)
+        else:
+            for v in node.values():  # a name -> schema map: every value is a schema
                 _walk(v, fn)
     elif isinstance(node, (list, tuple)):
         for v in node:
@@ -72,7 +90,8 @@ def _definitions(schema: Any) -> dict[str, dict[str, Any]]:
     found: dict[str, dict[str, Any]] = {}
 
     def record(node: dict[str, Any]) -> None:
-        if "ref" in node and node.get("type") != "definition-ref":
+        # `_walk` only offers nodes, so a `ref` here is a reference and not a field of that name
+        if isinstance(node.get("ref"), str) and node["type"] != "definition-ref":
             found[node["ref"]] = node
 
     _walk(schema, record)

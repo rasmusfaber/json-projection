@@ -2,7 +2,7 @@ import dataclasses
 import importlib
 import math
 import sys
-from typing import Any, Generic, TypeVar, Union
+from typing import Any, Generic, Literal, TypeVar, Union
 from unittest import mock
 
 import pydantic
@@ -14,13 +14,19 @@ from pydantic import (
     ConfigDict,
     Field,
     RootModel,
+    create_model,
     field_validator,
     model_validator,
 )
 from typing_extensions import TypedDict
 
 from json_projection import project
-from json_projection.pydantic import Projected, projected_validator, projection_spec
+from json_projection.pydantic import (
+    _DATA_KEYS,
+    Projected,
+    projected_validator,
+    projection_spec,
+)
 
 
 class Event(BaseModel):
@@ -708,3 +714,96 @@ def test_redundant_parent_and_child_exclusions():
     thin = Projected(Outer, {Outer: {"child"}, Child: {"secret"}})
     out = thin.validate_json(b'{"name":"n","child":{"keep":1,"secret":9}}')
     assert out.name == "n" and "child" not in out.__dict__
+
+
+@pytest.mark.parametrize("name", sorted(_DATA_KEYS))
+def test_a_field_named_like_a_data_key_is_still_a_field(name):
+    Child = _child()
+    Outer = create_model("Outer", **{name: (Child, ...)})  # type: ignore[call-overload]
+    child = Projected(Outer, {Child: {"secret"}}).validate_json(
+        b'{"' + name.encode() + b'":{"keep":1,"secret":9}}'
+    )
+    assert getattr(child, name).keep == 1 and getattr(child, name).secret == 0
+
+
+@pytest.mark.parametrize("name", sorted(_DATA_KEYS))
+def test_a_typeddict_key_named_like_a_data_key_is_still_a_key(name):
+    Child = _child()
+    TD = TypedDict("TD", {name: Child})  # type: ignore[misc,operator]  # a dynamic key name
+
+    class Outer(BaseModel):
+        payload: TD
+
+    raw = b'{"payload":{"' + name.encode() + b'":{"keep":1,"secret":9}}}'
+    out = Projected(Outer, {Child: {"secret"}}).validate_json(raw)
+    assert out.payload[name].keep == 1 and out.payload[name].secret == 0
+
+
+@pytest.mark.parametrize("name", sorted(_DATA_KEYS))
+def test_a_union_tag_named_like_a_data_key_is_still_a_choice(name):
+    Child = _child()
+
+    Tagged = create_model("Tagged", t=(Literal[name], name), child=(Child, ...))
+    Other = create_model("Other", t=(Literal["other"], "other"))
+
+    class Outer(BaseModel):
+        u: Union[Tagged, Other] = Field(discriminator="t")  # type: ignore[valid-type]
+
+    raw = b'{"u":{"t":"' + name.encode() + b'","child":{"keep":1,"secret":9}}}'
+    out = Projected(Outer, {Child: {"secret"}}).validate_json(raw)
+    assert out.u.child.keep == 1 and out.u.child.secret == 0
+
+
+def test_excluding_a_field_named_like_a_data_key_does_not_touch_the_original():
+    class M(BaseModel):
+        metadata: int = 0
+        keep: int = 1
+
+    before = repr(M.__pydantic_core_schema__)
+    Projected(M, {"metadata"})
+    assert repr(M.__pydantic_core_schema__) == before
+    assert Projected(M, set()).validate_json(b'{"metadata":9}').metadata == 9
+
+
+def test_a_field_named_ref_is_not_a_schema_reference():
+    class Ref(BaseModel):
+        ref: int
+        secret: int = 0
+
+    out = projected_validator(Ref, {"secret"}).validate_json(b'{"ref":1,"secret":9}')
+    assert out.model_dump() == {"ref": 1, "secret": 0}
+
+
+def test_an_excluded_class_under_a_typeddict_key_named_like_a_data_key_keeps_the_guards():
+    Child = _child(validate_by_name=True)
+
+    class Payload(TypedDict):
+        metadata: Child  # type: ignore[valid-type]
+
+    class Outer(BaseModel):
+        direct: Child  # type: ignore[valid-type]
+        payload: Payload
+
+    with pytest.raises(ValueError, match="by name"):
+        Projected(Outer, {Child: {"secret"}})
+
+
+def test_a_custom_init_under_a_field_named_like_a_data_key_is_refused():
+    Child = _child()
+
+    class Holder(BaseModel):
+        child: Child  # type: ignore[valid-type]
+
+        def __init__(self, **data: Any) -> None:
+            super().__init__(**data)
+
+    class WithInit(BaseModel):
+        direct: Child  # type: ignore[valid-type]
+        metadata: dict[str, Holder]
+
+    for build in (
+        lambda: Projected(WithInit, {Child: {"secret"}}),
+        lambda: projected_validator(WithInit, {Child: {"secret"}}),
+    ):
+        with pytest.raises(ValueError, match="its own __init__"):
+            build()

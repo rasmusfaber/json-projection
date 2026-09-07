@@ -147,7 +147,8 @@ thin = Projected(
 `inputs` are merged only for retained fields, so excluding `events` and `attachments` also drops
 `transcript`. `controls` are kept whenever present. Retaining a field whose dependency is excluded makes
 `Projected(...)` raise `ValueError`, which is why the example above must drop `timelines` too; with the
-inspect_ai adapters, likewise, `timelines` must go whenever `events` does. Anything the helper cannot express is a plain callable
+inspect_ai adapters, likewise, `timelines` must go whenever `events` does. Anything the helper cannot
+express is a plain callable
 `adapter(ctx: AdapterContext) -> Mapping[str, Any]`: `ctx.fields` are the retained field names and
 `ctx.spec` the projection derived for them, to modify and return -- a fresh dict per occurrence. Adapters
 run once per occurrence of the class, including occurrences inside subtrees the projection has to keep
@@ -215,7 +216,8 @@ an excluded key from the inputs it was given. `examples/inspect_adapters.py` hol
   that appears inside itself, an `extra='allow'` model with no excluded fields of its own, the object named by
   a multi-segment alias path, a JSON key that two fields describe differently. Nothing inside a kept subtree
   is projected, so when an excluded class is reachable in one, `Projected` keeps the standalone guards on for
-  every class in the schema.
+  every class in the schema. Adapters registered for classes inside such a subtree still run, and can still
+  refuse the exclusion set; only the spec they produce is discarded.
 - **RootModel is unsupported** in 0.1: `projection_spec` and `Projected` raise `TypeError`, and
   `projected_validator` reports the excluded names as not found. A `RootModel` declares one field, `root`,
   and the class it wraps is reached through it like any other nested model.

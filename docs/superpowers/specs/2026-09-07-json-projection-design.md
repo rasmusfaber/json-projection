@@ -142,8 +142,8 @@ from json_projection.pydantic import Projected, projection_spec, projected_valid
 
 thin = Projected(Log, exclude={Log: {"debug"}, Sample: {"events"}})
 log = thin.validate_json(raw)
-thin.spec        # Projection
-thin.validator   # pydantic_core.SchemaValidator
+thin.spec  # Projection
+thin.validator  # pydantic_core.SchemaValidator
 ```
 
 - `exclude` is a mapping from model class to field names, so nested third-party

@@ -1,5 +1,8 @@
+import importlib
 import math
+import sys
 from typing import Any, Generic, TypeVar
+from unittest import mock
 
 import pydantic
 import pytest
@@ -49,7 +52,8 @@ def test_required_excluded_field_is_absent_and_default_excluded_field_keeps_defa
 
 def test_excluded_value_is_never_validated():
     v = projected_validator(Log, {Log: {"debug"}, Sample: {"events"}})
-    log = v.validate_json(b'{"name":"x","createdBy":"y","debug":"not a dict","samples":[{"id":1,"score":1,"events":7}]}')
+    raw = b'{"name":"x","createdBy":"y","debug":"not a dict","samples":[{"id":1,"score":1,"events":7}]}'
+    log = v.validate_json(raw)
     assert log.debug == {} and log.samples[0].id == 1
 
 
@@ -133,7 +137,8 @@ def test_assume_projected_skips_the_guards():
         b: list[int]
 
     v = projected_validator(Strict, {"b"}, assume_projected=True)
-    assert "b" not in v.validate_json(b'{"a": 1}').__dict__  # input already projected: no excluded key present
+    # input already projected: no excluded key present
+    assert "b" not in v.validate_json(b'{"a": 1}').__dict__
 
 
 def test_projection_spec_derives_keys_aliases_and_all():
@@ -268,8 +273,31 @@ def test_projected_recursive_ignore_model_excludes_at_every_depth():
         blob: dict[str, Any] = {}
 
     Node.model_rebuild()
-    raw = b'{"v":1,"secret":{"x":1},"blob":{"a":1},"children":[{"v":2,"secret":{"y":2},"blob":{"b":2},"children":[]}]}'
+    raw = (
+        b'{"v":1,"secret":{"x":1},"blob":{"a":1},'
+        b'"children":[{"v":2,"secret":{"y":2},"blob":{"b":2},"children":[]}]}'
+    )
     n = Projected(Node, {Node: {"secret", "blob"}}).validate_json(raw)
     assert "secret" not in n.__dict__ and n.blob == {}
     child = n.children[0]
     assert "secret" not in child.__dict__ and child.blob == {} and child.v == 2
+
+
+def test_import_guard_rejects_old_pydantic(monkeypatch):
+    import json_projection.pydantic as jpp
+
+    monkeypatch.setattr(pydantic, "VERSION", "2.12.5")
+    sys.modules.pop("json_projection.pydantic", None)
+    with pytest.raises(ImportError, match="pydantic>=2.13"):
+        importlib.import_module("json_projection.pydantic")
+    monkeypatch.undo()
+    sys.modules["json_projection.pydantic"] = jpp  # restore for the remaining tests
+
+
+def test_prebuilt_substitution_is_detected():
+    with mock.patch("json_projection.pydantic.SchemaValidator") as fake:
+        fake.return_value = mock.Mock(
+            __repr__=lambda self: "SchemaValidator(validator=PrebuiltValidator(...))"
+        )
+        with pytest.raises(RuntimeError, match="prebuilt"):
+            projected_validator(Log, {Sample: {"events"}})

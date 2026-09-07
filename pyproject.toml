@@ -48,7 +48,7 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 110
 target-version = "py39"
-src = [".", "python"]
+src = [".", "python", "tests"]
 # gen_shapes.py is the prototype's dense generator, kept verbatim; formatting it buys nothing
 extend-exclude = ["benchmarks/gen_shapes.py"]
 

@@ -14,7 +14,9 @@ try:
     from pydantic import BaseModel
     from pydantic_core import SchemaValidator
 except ImportError as e:  # pragma: no cover
-    raise ImportError("json_projection.pydantic requires pydantic>=2.13: pip install 'json-projection[pydantic]'") from e
+    raise ImportError(
+        "json_projection.pydantic requires pydantic>=2.13: pip install 'json-projection[pydantic]'"
+    ) from e
 
 _m = re.match(r"(\d+)\.(\d+)", pydantic.VERSION)
 if _m is None or (int(_m.group(1)), int(_m.group(2))) < (2, 13):
@@ -70,7 +72,8 @@ def projected_validator(
     With ``assume_projected=False`` (validating raw input) classes whose configuration would still let
     pydantic read an excluded key are refused with ``ValueError``: ``extra='forbid'`` or ``extra='allow'``,
     and ``populate_by_name``/``validate_by_name`` when a field with a default is excluded. `Projected`
-    passes ``assume_projected=True`` because its byte projection removes those keys before validation.
+    passes ``assume_projected=True`` when its derived projection covers every occurrence of every class
+    (no recursion cut-off), because the byte projection then removes those keys before validation.
     """
     excluded = normalize_exclude(model, exclude)
     schema = _copy(model.__pydantic_core_schema__)
@@ -88,7 +91,9 @@ def projected_validator(
             return
         fields = _fields_node(node)
         if fields is None:
-            raise TypeError(f"{cls.__qualname__}: no 'model-fields' under its 'model' node; core schema shape changed")
+            raise TypeError(
+                f"{cls.__qualname__}: no 'model-fields' under its 'model' node; core schema shape changed"
+            )
         for name in names:
             field = fields["fields"].get(name)
             if field is None:
@@ -156,11 +161,17 @@ def _derive_spec(model: type[BaseModel], excluded: dict[type, frozenset[str]]) -
     """The keep-spec for `model` minus `excluded`, and whether it covers every occurrence of every class.
 
     A class that appears inside itself is cut off at its second occurrence (a spec is a finite tree), so
-    below that point the projection keeps whole values and cannot remove excluded keys; `complete` is False then.
+    below that point the projection keeps whole values and cannot remove excluded keys; `complete` is
+    False then.
     """
     schema: dict[str, Any] = cast("dict[str, Any]", model.__pydantic_core_schema__)
     definitions: dict[str, dict[str, Any]] = {}
-    _walk(schema, lambda n: definitions.__setitem__(n["ref"], n) if "ref" in n and n.get("type") != "definition-ref" else None)
+
+    def _record_ref(n: dict[str, Any]) -> None:
+        if "ref" in n and n.get("type") != "definition-ref":
+            definitions[n["ref"]] = n
+
+    _walk(schema, _record_ref)
     complete = [True]
 
     def spec_for(node: dict[str, Any], seen: frozenset[type]) -> Any:
@@ -170,11 +181,24 @@ def _derive_spec(model: type[BaseModel], excluded: dict[type, frozenset[str]]) -
         if t == "definition-ref":
             target = definitions.get(node["schema_ref"])
             return True if target is None else spec_for(target, seen)
-        if t in ("nullable", "default", "function-before", "function-after", "function-wrap", "function-plain"):
+        if t in (
+            "nullable",
+            "default",
+            "function-before",
+            "function-after",
+            "function-wrap",
+            "function-plain",
+        ):
             return spec_for(node["schema"], seen) if isinstance(node.get("schema"), dict) else True
         if t in ("list", "set", "frozenset"):
-            return {"__all__": spec_for(node["items_schema"], seen)} if isinstance(node.get("items_schema"), dict) else True
-        if t == "tuple" and node.get("variadic_item_index") is not None and len(node.get("items_schema", [])) == 1:
+            if not isinstance(node.get("items_schema"), dict):
+                return True
+            return {"__all__": spec_for(node["items_schema"], seen)}
+        if (
+            t == "tuple"
+            and node.get("variadic_item_index") is not None
+            and len(node.get("items_schema", [])) == 1
+        ):
             return {"__all__": spec_for(node["items_schema"][0], seen)}  # tuple[X, ...]
         if t == "model":
             cls = node["cls"]

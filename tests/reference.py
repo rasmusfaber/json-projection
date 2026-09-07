@@ -27,7 +27,9 @@ _WORDS = ["a", "b", "id", "name", "items", "meta", "é", "日本", "x,y", 'q"q',
 def _value(rng: random.Random, depth: int) -> Any:
     r = rng.random()
     if depth > 3 or r < 0.35:
-        return rng.choice([None, True, False, 0, -1, 1.5, 1e300, float("nan"), float("inf"), "s", "é\n\t", "x" * 50])
+        return rng.choice(
+            [None, True, False, 0, -1, 1.5, 1e300, float("nan"), float("inf"), "s", "é\n\t", "x" * 50]
+        )
     if r < 0.65:
         return [_value(rng, depth + 1) for _ in range(rng.randint(0, 4))]
     return {rng.choice(_WORDS): _value(rng, depth + 1) for _ in range(rng.randint(0, 5))}

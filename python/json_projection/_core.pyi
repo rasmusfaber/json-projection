@@ -3,7 +3,8 @@ from collections.abc import Iterable, Mapping
 __version__: str
 
 Spec = Iterable[str] | Mapping[str, bool | Spec]
-"""A keep-spec: keys to keep (each kept whole), or a mapping of key -> True | nested spec | {"__all__": spec}."""
+"""A keep-spec: keys to keep (each kept whole), or a mapping of key ->
+True | nested spec | {"__all__": spec}."""
 
 Data = bytes | bytearray | memoryview | str
 

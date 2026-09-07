@@ -1,7 +1,7 @@
 # Projection adapters for models with migration validators: design
 
 Date: 2026-09-07
-Status: approved in discussion, awaiting written review
+Status: approved; implemented in 0.2.0
 Extends: `2026-09-07-json-projection-design.md` (json-projection 0.1.0)
 Target version: 0.2.0
 
@@ -93,12 +93,12 @@ pure functions of their context.
 ### `migration_adapter`
 
 ```python
-Path = str | tuple[str, ...]      # one JSON key, or a nested key path
+KeyPath = str | tuple[str, ...]      # one JSON key, or a nested key path
 
 def migration_adapter(
     *,
-    inputs: Mapping[str, Iterable[Path]] | None = None,
-    controls: Iterable[Path] = (),
+    inputs: Mapping[str, Iterable[KeyPath]] | None = None,
+    controls: Iterable[KeyPath] = (),
     requires: Mapping[str, Iterable[str]] | None = None,
 ) -> ProjectionAdapter
 ```
@@ -127,18 +127,26 @@ opaque fallback:
 1. Look up `adapters.get(cls)`. Without an adapter the 0.1 behaviour stands: before/wrap/plain wrappers
    make the class opaque, and a root that is opaque raises `TypeError`. The message gains: "register a
    projection adapter for `<Cls>` (`projection_adapters=...`) to project through the validator".
-2. With an adapter, find the `model-fields` node through the wrappers, ignoring their kind (the adapter
+2. pydantic applies a `mode='wrap'` model validator *outside* the model node it wraps
+   (`function-wrap -> model -> function-before -> model-fields`, for a class with both a wrap and a
+   before validator), not inside it like `mode='before'`. So the derivation also looks through outer
+   `function-wrap`/`function-before` wrappers to a `model` node beneath them when that class has an
+   adapter and every wrapper passed on the way is a function bound to that class (`fn.__self__ is cls`):
+   the adapter vouches for those too. A validator that belongs to something else -- a field validator on
+   the enclosing model, an `Annotated` validator -- is bound to another class or to nothing, and stays
+   opaque.
+3. With an adapter, find the `model-fields` node through the wrappers, ignoring their kind (the adapter
    vouches for what the validator reads). A class with no fields node (a `RootModel`) is still opaque:
    an adapter cannot help there.
-3. Build the derived spec for the retained fields exactly as for any model (nested classes are derived
+4. Build the derived spec for the retained fields exactly as for any model (nested classes are derived
    recursively and may have their own adapters), then call the adapter with
    `AdapterContext(cls, retained_names, derived_spec)`.
-4. The result must be a `Mapping` with `str` keys, otherwise `TypeError` naming the class and the type
+5. The result must be a `Mapping` with `str` keys, otherwise `TypeError` naming the class and the type
    returned. It is compiled once with `Projection(result)` to validate the grammar; a compile error is
    re-raised as `TypeError` prefixed with the class name.
-5. The result replaces the derived spec for this object. Keys the adapter added are kept as it said; keys it
+6. The result replaces the derived spec for this object. Keys the adapter added are kept as it said; keys it
    removed are dropped; the excluded fields remain absent unless an input path or control re-adds their key.
-6. Completeness: the class marks the derivation incomplete when it has excluded fields of its own or when
+7. Completeness: the class marks the derivation incomplete when it has excluded fields of its own or when
    `_reaches_excluded` finds an excluded class below it. In either case a migration could recreate an
    excluded key from data the adapter kept, so the guards must stay on. An adapted class unrelated to any
    exclusion leaves completeness untouched.
@@ -155,7 +163,7 @@ derivation is incomplete in that situation.
 
 ## Example: inspect_ai
 
-Shipped as documentation and as `examples/inspect_ai.py` (not part of the package):
+Shipped as documentation and as `examples/inspect_adapters.py` (not part of the package):
 
 ```python
 from json_projection.pydantic import migration_adapter
@@ -166,17 +174,10 @@ sample_adapter = migration_adapter(
         "events": [("transcript", "events")],  # legacy transcript holds events and attachments
         "attachments": [("transcript", "content")],
     },
-    controls=["score"],  # the validator rejects score next to scores
     requires={"timelines": ["events"]},  # timelines reference events by id
 )
 
-log_adapter = migration_adapter(
-    inputs={
-        "reductions": [("results", "sample_reductions")],
-        "results": ["reductions"],  # the reverse fill
-    },
-    controls=["version"],
-)
+log_adapter = migration_adapter(inputs={"reductions": [("results", "sample_reductions")]})
 
 spec_adapter = migration_adapter(
     inputs={"task_args_passed": ["task_args"], "solver_args_passed": ["solver_args"]},
@@ -184,12 +185,14 @@ spec_adapter = migration_adapter(
 
 INSPECT_ADAPTERS = {EvalSample: sample_adapter, EvalLog: log_adapter, EvalSpec: spec_adapter}
 
-thin = Projected(
-    EvalLog,
-    exclude={EvalSample: {"events", "messages", "store", "attachments"}},
-    projection_adapters=INSPECT_ADAPTERS,
-)
+BULK_FIELDS = frozenset({"events", "messages", "store", "attachments", "timelines"})
+
+thin = Projected(EvalLog, exclude={EvalSample: BULK_FIELDS}, projection_adapters=INSPECT_ADAPTERS)
 ```
+
+`BULK_FIELDS` includes `timelines` alongside `events`: `sample_adapter` declares that retaining `timelines`
+requires `events`, so `requires={"timelines": ["events"]}` refuses excluding `events` while keeping
+`timelines`.
 
 With this exclusion set `transcript` is not kept, because neither `events` nor `attachments` is retained,
 so old logs get the memory saving too. The legacy `sandbox` array needs no adapter: it sits under a
@@ -199,7 +202,8 @@ declared key, and a kept value whose shape does not match its sub-spec is copied
 
 All in `tests/test_pydantic.py` unless noted.
 
-- **Property test (the correctness statement).** A synthetic model family in `tests/migration_models.py`:
+- **Property test (the correctness statement)**, in `tests/test_migrations.py`. A synthetic model family
+  in `tests/migration_models.py`:
   a root with a `mode='before'` validator that renames a legacy key and dispatches on a `version`
   control key; a nested class with a before validator that unnests a legacy `transcript` into `events`
   and `attachments`, migrates `score` to `scores`, and rejects `score` next to `scores`; a `mode='wrap'`
@@ -226,12 +230,16 @@ All in `tests/test_pydantic.py` unless noted.
   an adapted class unrelated to any exclusion leaves `complete` True.
 - A `function-plain` class with an adapter is still opaque.
 - `repr(Projected(...))` lists adapted classes.
-- **Optional inspect_ai round-trip** in `tests/test_inspect_ai.py`, skipped unless `inspect_ai` imports:
-  build a minimal current-format `EvalLog` with the real classes, dump it, hand-craft the legacy variant
-  (events and attachments moved under `transcript`, `scores` collapsed to `score`), and check both load
-  through `Projected(EvalLog, exclude={EvalSample: {"events", "messages", "store", "attachments"}},
-  projection_adapters=INSPECT_ADAPTERS)` with `retained_dump` equal to plain validation. inspect_ai is
-  not added to the dev dependency group; the test is a local check.
+- **Optional inspect_ai round-trip** in `tests/test_inspect_ai.py`, skipped unless `inspect_ai` imports and
+  its deserializing-context helper is importable: round-trip `tests/fixtures/inspect_legacy_log.json` (and
+  the same log re-dumped to current format) through `Projected(EvalLog, exclude={EvalSample: BULK_FIELDS},
+  projection_adapters=INSPECT_ADAPTERS)`, checking `retained_dump` equal to plain validation. Both parses
+  pass inspect_ai's deserializing context -- `get_deserializing_context()` from the private module
+  `inspect_ai._util.constants`, which the test module skips itself if that import fails -- because
+  inspect_ai regenerates ids (`EvalSpec.eval_id`, message ids) on every parse otherwise, which would make
+  even two plain parses of the same bytes disagree. A third case additionally excludes `EvalSpec.task_args`
+  to prove `task_args_passed`'s fallback survives losing its primary input. inspect_ai is not added to the
+  dev dependency group; the test is a local check.
 - Typing: `tests/test_typing.py` keeps passing (mypy `--strict`, basedpyright) with the new exports.
 
 ## Documentation

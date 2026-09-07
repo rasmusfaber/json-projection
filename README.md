@@ -115,6 +115,45 @@ Excluded fields that have a default keep their default. Excluded required fields
 and from `model_fields_set`. `exclude` is keyed by class so nested third-party models can be targeted; a plain
 set means the root model.
 
+### Migration validators
+
+A model whose fields sit behind a `model_validator(mode='before')` or `mode='wrap'` reads keys the schema
+does not declare: an old field name, a legacy `transcript` object, a `version` it dispatches on. The
+projection cannot know those keys, so such a class is kept whole -- or refused at the root -- unless you
+register a *projection adapter* that translates the fields retained after validation into the JSON inputs
+the validators need:
+
+```python
+from json_projection.pydantic import Projected, migration_adapter
+
+sample_adapter = migration_adapter(
+    inputs={  # retained field -> JSON paths a migration may read for it
+        "scores": ["score"],  # legacy single score
+        "events": [("transcript", "events")],  # legacy transcript held events and attachments
+        "attachments": [("transcript", "content")],
+    },
+    controls=["version"],  # keys a validator dispatches on: kept whenever present
+    requires={"timelines": ["events"]},  # retained field -> retained fields it depends on
+)
+
+thin = Projected(
+    Log, exclude={Sample: {"events", "attachments"}}, projection_adapters={Sample: sample_adapter}
+)
+```
+
+`inputs` are merged only for retained fields, so excluding `events` and `attachments` also drops
+`transcript`. `controls` are kept whenever present. Retaining a field whose dependency is excluded makes
+`Projected(...)` raise `ValueError`. With the inspect_ai adapters that means `timelines` must go whenever
+`events` does. Anything the helper cannot express is a plain callable
+`adapter(ctx: AdapterContext) -> Mapping[str, Any]`: `ctx.fields` are the retained field names and
+`ctx.spec` the projection derived for them, to modify and return. Adapters run once per occurrence of the
+class and must be pure. The validators themselves still perform the migration; the projection only makes
+sure they see what they need.
+
+Adapted classes keep the config guards on (see "Refused configurations") because a migration can recreate
+an excluded key from the inputs it was given. `examples/inspect_adapters.py` holds adapters for inspect_ai's
+`EvalLog`.
+
 ## What you give up
 
 - **Error payloads show the projected document.** A `ValidationError` on a whole object reports the input
@@ -136,7 +175,9 @@ set means the root model.
 - **Before/wrap/plain validators are not projected through.** Their input is not the shape the schema they
   wrap describes, so a model or field behind one is kept whole and nothing inside it is projected. A root
   model whose own fields sit behind a `model_validator(mode='before')`, `'wrap'` or `'plain'` cannot be
-  projected at all: `Projected` and `projection_spec` raise `TypeError`. Use `projected_validator` alone.
+  projected at all: `Projected` and `projection_spec` raise `TypeError`. Register a projection adapter for
+  the class (see "Migration validators") to project through a before or wrap validator; a plain validator
+  cannot be adapted, so use `projected_validator` alone.
 - **After validators and excluded required fields.** A `model_validator(mode='after')` that touches an excluded
   required field raises `AttributeError` from `validate_json`, not a `ValidationError`.
 - **Extras.** A model with `extra='allow'` that has no excluded field of its own is kept whole (nothing below it
@@ -148,7 +189,7 @@ set means the root model.
   the field up under its own name again, so a document that carries the excluded key populates the field
   and the default is not applied. `Projected.validate_json` refuses both flags with `ValueError` whenever
   its projection is incomplete, and forwards them when it is not (the projection stripped alias and name
-  alike).
+  alike). Projection adapters do not affect it: it never reads JSON.
 - **Kept-whole subtrees.** The derived projection describes models, lists, sets and variable-length tuples;
   everything else is kept whole -- dict values, unions, fixed tuples, dataclasses, TypedDicts, `Any`, a class
   that appears inside itself, an `extra='allow'` model with no excluded fields of its own, the object named by

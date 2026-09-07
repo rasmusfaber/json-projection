@@ -259,9 +259,10 @@ def main() -> None:
     )
     print("## Methodology\n")
     print(
-        f"Each table row runs in a fresh child. After imports, plan creation, and allocation of reusable "
-        f"source blocks, Linux ru_maxrss growth is sampled across the first call, before validation or "
-        f"timing. No complete source is read or assembled before that baseline. RSS is n/a elsewhere; "
+        f"Each table row runs in a fresh child. After imports, Projection construction, and allocation of "
+        f"reusable source blocks, Linux ru_maxrss growth is sampled across the first call, "
+        f"before validation or timing. The lazy streaming plan is created inside that first call. "
+        f"No complete source is read or assembled before that baseline. RSS is n/a elsewhere; "
         f"zero growth means no increase over the process's earlier high-water mark. Timing is the "
         f"median of {args.repeats} subsequent calls, with generation or file open/read and input assembly "
         f"included; validation and disposal of the returned value are outside the timer. Every output "

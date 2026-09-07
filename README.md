@@ -68,8 +68,9 @@ cannot be reused after `finish()` or a JSON error. Construct sessions with `Proj
 
 Streaming always raises `ValueError` for malformed JSON, including malformed discarded values, non-object
 roots, trailing non-whitespace input, or incomplete input at `finish()`. Errors include a zero-based byte
-offset in the original input, independent of chunk boundaries. Subsequent calls on a finished or failed
-session raise `RuntimeError`. A `TypeError` from passing a non-bytes chunk leaves an active session usable.
+offset in the original input, independent of chunk boundaries. Subsequent `feed(bytes)` or `finish()` calls
+on a finished or failed session raise `RuntimeError`. Passing a non-bytes chunk always raises `TypeError`
+and leaves an active session usable.
 There is no invalid-input passthrough: the original discarded bytes are no longer available.
 
 Selection rules, duplicate-member order, raw key/value spelling, and `NaN`/`Infinity` support match

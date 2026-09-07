@@ -29,6 +29,8 @@ _EXCLUDED_ALIAS_PREFIX = "\x00excluded:"
 
 
 def normalize_exclude(model: type[BaseModel], exclude: Exclude) -> dict[type, frozenset[str]]:
+    if isinstance(exclude, str):  # an iterable of characters, never what the caller meant
+        raise TypeError("exclude must be a set of field names or a mapping {model: field names}, not a str")
     if isinstance(exclude, Mapping):
         return {cls: frozenset(names) for cls, names in cast("Mapping[type, Iterable[str]]", exclude).items()}
     return {model: frozenset(exclude)}
@@ -51,6 +53,11 @@ def _walk(node: Any, fn: Any) -> None:
     elif isinstance(node, list):
         for v in node:
             _walk(v, fn)
+
+
+def _extra(cls: type) -> Any:
+    """The effective `extra` setting of `cls`; the only place either the guards or `_derive_spec` read it."""
+    return getattr(cls, "model_config", {}).get("extra")
 
 
 def _fields_node(model_node: dict[str, Any]) -> dict[str, Any] | None:
@@ -101,17 +108,18 @@ def projected_validator(
             hit.add((cls, name))
             has_default = field["schema"].get("type") == "default"
             if not assume_projected:
-                cfg = getattr(cls, "model_config", {})
-                if cfg.get("extra") == "forbid":
+                extra = _extra(cls)
+                if extra == "forbid":
                     raise ValueError(
                         f"{cls.__qualname__} uses extra='forbid': the excluded key {name!r} would be "
                         "rejected as an extra"
                     )
-                if cfg.get("extra") == "allow":
+                if extra == "allow":
                     raise ValueError(
                         f"{cls.__qualname__} uses extra='allow': the excluded key {name!r} would be "
                         "captured as an extra"
                     )
+                cfg = getattr(cls, "model_config", {})
                 if has_default and (cfg.get("populate_by_name") or cfg.get("validate_by_name")):
                     raise ValueError(
                         f"{cls.__qualname__} populates fields by name: the excluded field {name!r} would "
@@ -138,31 +146,36 @@ def projected_validator(
 from json_projection import Projection  # noqa: E402  (after the import guard on purpose)
 
 
-def _field_keys(name: str, alias: Any) -> list[str]:
-    """JSON keys under which pydantic may look for this field: aliases first, then the name."""
-    keys: list[str] = []
+def _field_keys(name: str, alias: Any) -> list[tuple[str, bool]]:
+    """JSON keys under which pydantic may look for this field: aliases first, then the name.
+
+    Each key comes with `direct`: whether the value under it is the field's own value. A multi-segment
+    alias path is not direct — its first segment holds an enclosing object the field sits somewhere
+    inside, so the field's sub-spec does not describe it.
+    """
+    keys: list[tuple[str, bool]] = []
     if isinstance(alias, str):
-        keys.append(alias)
+        keys.append((alias, True))
     elif isinstance(alias, list):
         if alias and all(isinstance(seg, (str, int)) for seg in alias):  # AliasPath
             if isinstance(alias[0], str):
-                keys.append(alias[0])
+                keys.append((alias[0], len(alias) == 1))
         else:  # AliasChoices: list of paths
             for choice in alias:
                 if isinstance(choice, str):
-                    keys.append(choice)
+                    keys.append((choice, True))
                 elif isinstance(choice, list) and choice and isinstance(choice[0], str):
-                    keys.append(choice[0])
-    keys.append(name)
+                    keys.append((choice[0], len(choice) == 1))
+    keys.append((name, True))
     return list(dict.fromkeys(keys))
 
 
 def _derive_spec(model: type[BaseModel], excluded: dict[type, frozenset[str]]) -> tuple[dict[str, Any], bool]:
     """The keep-spec for `model` minus `excluded`, and whether it covers every occurrence of every class.
 
-    A class that appears inside itself is cut off at its second occurrence (a spec is a finite tree), so
-    below that point the projection keeps whole values and cannot remove excluded keys; `complete` is
-    False then.
+    The spec is cut off at a class that appears inside itself (a spec is a finite tree) and at an
+    `extra='allow'` class with no excluded fields of its own (its undeclared keys are data). Below such a
+    cut-off the projection keeps whole values and cannot remove excluded keys; `complete` is False then.
     """
     schema: dict[str, Any] = cast("dict[str, Any]", model.__pydantic_core_schema__)
     definitions: dict[str, dict[str, Any]] = {}
@@ -205,6 +218,11 @@ def _derive_spec(model: type[BaseModel], excluded: dict[type, frozenset[str]]) -
             if cls in seen:
                 complete[0] = False
                 return True
+            if _extra(cls) == "allow" and not excluded.get(cls):
+                # undeclared keys are data on this class, so keep the whole object. An excluded class
+                # may sit below it, whose keys the projection then cannot remove: a cut-off like recursion.
+                complete[0] = False
+                return True
             fields = _fields_node(node)
             if fields is None:
                 return True
@@ -213,13 +231,20 @@ def _derive_spec(model: type[BaseModel], excluded: dict[type, frozenset[str]]) -
                 if name in excluded.get(cls, ()):
                     continue
                 sub = spec_for(field["schema"], seen | {cls})
-                for key in _field_keys(name, field.get("validation_alias")):
-                    out[key] = sub
+                for key, direct in _field_keys(name, field.get("validation_alias")):
+                    value = sub if direct else True
+                    # two fields under one JSON key describe it differently: keep it whole
+                    out[key] = value if out.get(key, value) == value else True
             return out
         return True  # dict, Any, unions, scalars: keep the value as-is
 
     root = spec_for(schema, frozenset())
     if not isinstance(root, dict):
+        if _extra(model) == "allow" and not excluded.get(model):
+            raise TypeError(
+                f"cannot derive a projection for {model.__qualname__}: it allows extra fields and none "
+                "of its own fields are excluded; exclude a field on it or use projected_validator alone"
+            )
         raise TypeError(f"{model.__qualname__}: could not derive an object spec from its core schema")
     return root, complete[0]
 

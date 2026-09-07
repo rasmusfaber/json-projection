@@ -301,3 +301,79 @@ def test_prebuilt_substitution_is_detected():
         )
         with pytest.raises(RuntimeError, match="prebuilt"):
             projected_validator(Log, {Sample: {"events"}})
+
+
+def test_projection_spec_multi_segment_alias_path_keeps_the_outer_object_whole():
+    class Sub(BaseModel):
+        x: int
+
+    class A(BaseModel):
+        s: Sub = Field(validation_alias=AliasPath("outer", "inner"))
+        junk: dict[str, Any] = {}
+
+    raw = b'{"outer": {"inner": {"x": 1}}, "junk": {"big": 1}}'
+    assert projection_spec(A, {"junk"}) == {"outer": True, "s": {"x": True}}
+    assert Projected(A, {"junk"}).validate_json(raw).s.x == 1
+
+
+def test_projection_spec_alias_choices_with_a_path_keeps_the_outer_object_whole():
+    class Sub(BaseModel):
+        x: int
+
+    class A(BaseModel):
+        s: Sub = Field(validation_alias=AliasChoices("s", AliasPath("outer", "inner")))
+        junk: dict[str, Any] = {}
+
+    assert projection_spec(A, {"junk"}) == {"s": {"x": True}, "outer": True}
+    raw = b'{"outer": {"inner": {"x": 1}}, "junk": {"big": 1}}'
+    assert Projected(A, {"junk"}).validate_json(raw).s.x == 1
+
+
+def test_projection_spec_key_collision_falls_back_to_true():
+    class Sub(BaseModel):
+        x: int
+
+    class Coll(BaseModel):
+        x: dict[str, Any]
+        s: Sub = Field(validation_alias="x")
+
+    assert projection_spec(Coll, set()) == {"x": True, "s": {"x": True}}
+    raw = b'{"x": {"x": 1, "other": 2}}'
+    assert Projected(Coll, set()).validate_json(raw).x == Coll.model_validate_json(raw).x
+
+
+def test_nested_extra_allow_model_without_own_exclusions_is_kept_whole():
+    class Loose(BaseModel):
+        model_config = ConfigDict(extra="allow")
+        a: int
+
+    class Outer(BaseModel):
+        inner: Loose
+        junk: dict[str, Any] = {}
+
+    raw = b'{"inner": {"a": 1, "extra_k": 2}, "junk": {"z": 1}}'
+    assert projection_spec(Outer, {"junk"}) == {"inner": True}
+    out = Projected(Outer, {"junk"}).validate_json(raw)
+    assert out.inner.model_extra == {"extra_k": 2} and out.junk == {}
+
+
+def test_root_extra_allow_without_own_exclusions_is_refused():
+    class Sub(BaseModel):
+        x: int
+        junk: dict[str, Any] = {}
+
+    class Root(BaseModel):
+        model_config = ConfigDict(extra="allow")
+        inner: Sub
+
+    with pytest.raises(TypeError, match="allows extra fields"):
+        projection_spec(Root, {Sub: {"junk"}})
+    with pytest.raises(TypeError, match="allows extra fields"):
+        Projected(Root, {Sub: {"junk"}})
+
+
+def test_bare_str_exclude_is_a_type_error():
+    with pytest.raises(TypeError, match="not a str"):
+        projected_validator(Log, "debug")
+    with pytest.raises(TypeError, match="not a str"):
+        Projected(Log, "debug")

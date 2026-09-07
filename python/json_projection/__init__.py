@@ -1,5 +1,5 @@
 """Strip unwanted members from JSON bytes before validation."""
 
-from ._core import __version__
+from ._core import Projection, __version__, project
 
-__all__ = ["__version__"]
+__all__ = ["Projection", "__version__", "project"]

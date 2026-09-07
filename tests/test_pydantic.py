@@ -655,3 +655,56 @@ def test_root_model_fields_are_not_taken_from_the_wrapped_class():
         projection_spec(Root, set())
     with pytest.raises(TypeError):
         Projected(Root, {"x"})
+
+
+def test_custom_init_models_are_refused_when_exclusion_touches_them():
+    class M(BaseModel):
+        x: int
+        secret: int = 0
+
+        def __init__(self, **data: Any) -> None:
+            super().__init__(**data)
+
+    for build in (lambda: projected_validator(M, {"secret"}), lambda: Projected(M, {"secret"})):
+        with pytest.raises(ValueError, match="its own __init__"):
+            build()
+    with pytest.raises(ValueError, match="its own __init__"):
+        projected_validator(M, {"x"})
+
+
+def test_custom_init_above_an_excluded_class_is_refused_but_below_it_is_not():
+    class Child(BaseModel):
+        keep: int
+        secret: int = 0
+
+    class Holder(BaseModel):
+        child: Child
+
+        def __init__(self, **data: Any) -> None:
+            super().__init__(**data)
+
+    class Outer(BaseModel):
+        holder: Holder
+        junk: dict[str, Any] = {}
+
+    with pytest.raises(ValueError, match="Holder defines its own __init__"):
+        Projected(Outer, {Child: {"secret"}})
+    # a custom __init__ that no exclusion reaches stays allowed
+    out = Projected(Outer, {Outer: {"junk"}}).validate_json(
+        b'{"holder":{"child":{"keep":1,"secret":9}},"junk":{"big":1}}'
+    )
+    assert out.junk == {} and out.holder.child.secret == 9
+
+
+def test_redundant_parent_and_child_exclusions():
+    class Child(BaseModel):
+        secret: int
+        keep: int
+
+    class Outer(BaseModel):
+        child: Child
+        name: str
+
+    thin = Projected(Outer, {Outer: {"child"}, Child: {"secret"}})
+    out = thin.validate_json(b'{"name":"n","child":{"keep":1,"secret":9}}')
+    assert out.name == "n" and "child" not in out.__dict__

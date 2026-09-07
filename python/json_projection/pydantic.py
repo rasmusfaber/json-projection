@@ -117,6 +117,28 @@ def _fields_node(
     return None, opaque_kind
 
 
+def _reaches_excluded(
+    node: dict[str, Any], definitions: dict[str, dict[str, Any]], excluded: dict[type, frozenset[str]]
+) -> bool:
+    """Whether an excluded class has a `model` node at or below `node`, following each ref once."""
+    hit = [False]
+    refs: set[str] = set()
+    pending = [node]
+
+    def look(n: dict[str, Any]) -> None:
+        if n.get("type") == "model" and excluded.get(n["cls"]):
+            hit[0] = True
+        ref = n.get("schema_ref")
+        if isinstance(ref, str) and ref not in refs:
+            refs.add(ref)
+            if ref in definitions:
+                pending.append(definitions[ref])
+
+    while pending and not hit[0]:
+        _walk(pending.pop(), look)
+    return hit[0]
+
+
 def projected_validator(
     model: type[BaseModel], exclude: Exclude, *, assume_projected: bool = False
 ) -> SchemaValidator:
@@ -132,12 +154,32 @@ def projected_validator(
     and ``populate_by_name``/``validate_by_name`` when a field with a default is excluded. `Projected`
     passes ``assume_projected=True`` only when its derived projection provably covers every occurrence
     of every excluded class, because the byte projection then removes those keys before validation.
+
+    A class with its own ``__init__`` is refused with ``ValueError`` whenever exclusion would touch it
+    or anything below it, whatever ``assume_projected`` says: pydantic-core calls that ``__init__``,
+    which validates through the class's original validator and ignores the edit.
     """
     excluded = normalize_exclude(model, exclude)
     schema = _copy(model.__pydantic_core_schema__)
     definitions = _definitions(schema)
     config: list[Any] = []
-    hit: set[tuple[type, str]] = set()
+
+    # the names are validated against the unedited schema: removing a required field would hide the
+    # class it holds from the rest of the walk, and its own valid exclusions would look like typos
+    present: set[tuple[type, str]] = set()
+
+    def find(node: dict[str, Any]) -> None:
+        names = excluded.get(node["cls"]) if node.get("type") == "model" else None
+        if names:
+            fields, _ = _fields_node(node, definitions)
+            if fields is not None:
+                present.update((node["cls"], n) for n in names if n in fields["fields"])
+
+    _walk(schema, find)
+    missing = {(cls, n) for cls, names in excluded.items() for n in names} - present
+    if missing:
+        desc = ", ".join(f"{cls.__qualname__}.{n}" for cls, n in sorted(missing, key=str))
+        raise ValueError(f"fields not found in the schema of {model.__qualname__}: {desc}")
 
     def visit(node: dict[str, Any]) -> None:
         if node.get("type") != "model":
@@ -145,18 +187,23 @@ def projected_validator(
         cls: type = node["cls"]  # a 'model' node always carries its class
         if cls is model and not config:
             config.append(node.get("config"))
+        if node.get("custom_init") and _reaches_excluded(node, definitions, excluded):
+            # pydantic-core calls the class's __init__, which validates through the class's own
+            # __pydantic_validator__: the edit below would simply not be used
+            raise ValueError(
+                f"{cls.__qualname__} defines its own __init__, which re-enters the original validator; "
+                "exclusion cannot be applied"
+            )
         names = excluded.get(cls)
         if not names:
             return
         fields, _ = _fields_node(node, definitions)
         if fields is None:
-            # no fields of its own (a RootModel wraps another schema); the check below reports the names
-            return
+            return  # no fields of its own: a RootModel wraps another schema
         for name in names:
             field = fields["fields"].get(name)
             if field is None:
                 continue
-            hit.add((cls, name))
             has_default = field["schema"].get("type") == "default"
             if not assume_projected:
                 extra = _extra(cls)
@@ -184,11 +231,6 @@ def projected_validator(
                 fields["fields"].pop(name)
 
     _walk(schema, visit)
-    missing = {(cls, n) for cls, names in excluded.items() for n in names} - hit
-    if missing:
-        desc = ", ".join(f"{cls.__qualname__}.{n}" for cls, n in sorted(missing, key=str))
-        raise ValueError(f"fields not found in the schema of {model.__qualname__}: {desc}")
-
     validator = SchemaValidator(schema, config[0] if config else None, _use_prebuilt=False)
     if "PrebuiltValidator" in repr(validator):
         raise RuntimeError("pydantic-core reused a prebuilt validator; the exclusion would be ignored")
@@ -237,32 +279,13 @@ def _derive_spec(model: type[BaseModel], excluded: dict[type, frozenset[str]]) -
     complete = [True]
     wrapper_kind: list[str] = []
 
-    def reaches_excluded(node: dict[str, Any]) -> bool:
-        """Whether an excluded class has a `model` node under `node`, following each ref once."""
-        hit = [False]
-        refs: set[str] = set()
-        pending = [node]
-
-        def look(n: dict[str, Any]) -> None:
-            if n.get("type") == "model" and excluded.get(n["cls"]):
-                hit[0] = True
-            ref = n.get("schema_ref")
-            if isinstance(ref, str) and ref not in refs:
-                refs.add(ref)
-                if ref in definitions:
-                    pending.append(definitions[ref])
-
-        while pending and not hit[0]:
-            _walk(pending.pop(), look)
-        return hit[0]
-
     def opaque(node: dict[str, Any]) -> bool:
         """Keep this subtree whole, and say so: `True`.
 
         Every fallback goes through here. Below a kept subtree nothing is projected, so an excluded
         class reachable in it keeps its keys and the derivation is no longer complete.
         """
-        if reaches_excluded(node):
+        if _reaches_excluded(node, definitions, excluded):
             complete[0] = False
         return True
 

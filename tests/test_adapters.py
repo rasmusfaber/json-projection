@@ -601,3 +601,68 @@ def test_many_fields_on_one_colliding_key_stay_linear(monkeypatch: pytest.Monkey
     assert spec == {"x": True, **{f"f{i}": {"v": True} for i in range(n)}}
     assert walks[0] <= 2 * n + 10, walks[0]  # one pass per contributor, not one per pair
     assert elapsed < 0.1
+
+
+class Reused(BaseModel):
+    """Its own registered before validator, also reused as an `Annotated` validator on a parent field."""
+
+    x: int
+    blob: dict[str, Any] = {}
+
+    @model_validator(mode="before")
+    @classmethod
+    def unwrap(cls, data: Any) -> Any:
+        return data["inner"] if isinstance(data, dict) and "inner" in data else data
+
+
+class ReusedHolder(BaseModel):
+    # unwraps twice: once here, once inside `Reused` itself
+    child: Annotated[Reused, BeforeValidator(Reused.unwrap)]  # pyright: ignore[reportArgumentType]
+    plain: Optional[Reused] = None
+    junk: dict[str, Any] = {}
+
+
+REUSED_EXCLUDE = {ReusedHolder: {"junk"}, Reused: {"blob"}}
+
+
+def test_a_registered_validator_reused_at_a_field_is_a_foreign_wrapper():
+    """The function is one of `Reused`'s own, but the extra pass reads a shape nobody described."""
+    raw = b'{"child": {"inner": {"inner": {"x": 7, "blob": {"b": 1}}}}, "junk": {"a": 1}}'
+    thin = Projected(ReusedHolder, REUSED_EXCLUDE, projection_adapters={Reused: migration_adapter()})
+    assert thin.complete is False  # the child is kept whole, so its `blob` survives the projection
+    assert b"inner" in thin.spec(raw) and b"blob" in thin.spec(raw)
+    assert thin.validate_json(raw).child.x == ReusedHolder.model_validate_json(raw).child.x == 7
+
+
+def test_the_same_class_without_the_extra_wrapper_is_still_projected():
+    spec = projection_spec(
+        ReusedHolder, REUSED_EXCLUDE, projection_adapters={Reused: migration_adapter(controls=["ctl"])}
+    )
+    assert spec["child"] is True  # the foreign wrapper keeps this occurrence whole
+    assert spec["plain"] == {"x": True, "ctl": True}  # this one is the class's own shape
+
+
+class Wrapped(BaseModel):
+    x: int = 0
+    blob: dict[str, Any] = {}
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def wrap(cls, data: Any, handler: Any) -> Any:
+        return handler(data)
+
+
+class WrappedHolder(BaseModel):
+    """Two usages, so pydantic hoists `Wrapped` into `definitions` and refers to it by ref."""
+
+    a: Wrapped = Wrapped()
+    b: Optional[Wrapped] = None
+
+
+def test_an_own_wrap_validator_counts_through_nullable_and_definition_ref():
+    spec = projection_spec(
+        WrappedHolder,
+        {Wrapped: {"blob"}},
+        projection_adapters={Wrapped: migration_adapter(controls=["ctl"])},
+    )
+    assert spec == {"a": {"x": True, "ctl": True}, "b": {"x": True, "ctl": True}}

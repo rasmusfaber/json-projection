@@ -139,14 +139,22 @@ opaque fallback:
    (`function-wrap -> model -> function-before -> model-fields`, for a class with both a wrap and a
    before validator), not inside it like `mode='before'`. So the derivation also looks through outer
    `function-wrap`/`function-before` wrappers to a `model` node beneath them when that class has an
-   adapter and every wrapper passed on the way is one of the class's *own registered model validators*
-   -- its function, unwrapped through `__func__`, is the `func` of an entry in
-   `cls.__pydantic_decorators__.model_validators`, which covers `@classmethod`, `@staticmethod` and
-   inherited validators alike: the adapter vouches for those too. Ownership is registration, not
-   binding. A validator that belongs to something else -- a field validator on the enclosing model, an
-   `Annotated` validator, even one that is a bound method of the adapted class -- is registered on
-   nothing, and stays opaque. At the root such a wrapper raises `TypeError` naming the class and saying
-   the adapter cannot vouch for the wrapper, instead of asking for an adapter that is already there.
+   adapter and the wrappers passed on the way are *exactly the ones the class's own schema emits*. Two
+   conditions, both required. Every wrapper function, unwrapped through `__func__`, must be the `func`
+   of an entry in `cls.__pydantic_decorators__.model_validators`, which covers `@classmethod`,
+   `@staticmethod` and inherited validators alike -- so a function installed from outside, through
+   `__get_pydantic_core_schema__` for instance, is refused. And the ordered sequence of wrapper
+   functions between the usage node and the `model` node must *equal* the sequence between the root of
+   `cls.__pydantic_core_schema__` and that class's own `model` node (both walks resolve
+   `definitions`/`definition-ref` and step through `default`/`nullable`/`function-after`, as
+   `_fields_node` does; the reference sequence is cached per class per derivation). Ownership is
+   neither binding nor mere membership: an `Annotated[Cls, BeforeValidator(Cls.migrate)]` on somebody's
+   field reuses a registered function but adds a wrapper, and that extra pass reads a shape the adapter
+   never described, so the sequences differ and the class stays opaque. A field validator on the
+   enclosing model is the same. Note that a class's own *before* validators sit inside its `model` node
+   (`function-before` around `model-fields`) and are not part of this outer sequence; its *wrap*
+   validators sit outside it and are. At the root a foreign wrapper raises `TypeError` naming the class
+   and saying the adapter cannot vouch for the wrapper, instead of asking for an adapter already there.
 3. With an adapter, find the `model-fields` node through the wrappers, ignoring their kind (the adapter
    vouches for what the validator reads). A class with no fields node (a `RootModel`) is still opaque:
    an adapter cannot help there.

@@ -149,40 +149,71 @@ def _own_model_validators(cls: type) -> set[int]:
     return {id(getattr(d.func, "__func__", d.func)) for d in validators.values()}
 
 
-def _adapted_model_behind(
-    node: dict[str, Any], definitions: dict[str, dict[str, Any]], adapters: Mapping[type, ProjectionAdapter]
-) -> tuple[dict[str, Any] | None, bool]:
-    """The `model` node behind `node`'s outer wrappers when its class has an adapter, and whether the
-    adapter vouches for those wrappers.
+def _outer_wrappers(
+    node: Any, definitions: dict[str, dict[str, Any]]
+) -> tuple[dict[str, Any] | None, list[int]]:
+    """The `model` node behind `node`'s outer wrappers, and the identity of each wrapper's function.
 
-    A class-level wrap validator wraps the model node from outside, and the adapter speaks for it. A
-    validator that belongs to something else -- a field validator on the enclosing model, an `Annotated`
-    validator, even one that is a bound method of this very class -- is not registered on it, so the
-    adapter knows nothing about what it reads and the node stays opaque. Ownership is registration, not
-    binding: the wrapper's function must be one of the class's own model validators.
-
-    Returns `(None, False)` when there is no adapted model behind the wrappers, and `(node, False)` when
-    there is one but a wrapper is not the class's own.
+    Walks the same wrapper kinds as `_fields_node`; anything else means no model node sits here. A
+    class's own before validators are *inside* its model node and never appear in this sequence; its
+    wrap validators are outside it and always do.
     """
-    functions: list[Any] = []
+    functions: list[int] = []
     n: Any = node
     while isinstance(n, dict):
         t = n.get("type")
         if t == "model":
-            cls = n["cls"]
-            if cls not in adapters:
-                return None, False
-            own = _own_model_validators(cls)
-            return n, all(id(getattr(fn, "__func__", fn)) in own for fn in functions)
+            return n, functions
         if t in _OPAQUE_WRAPPERS:
-            functions.append(n.get("function", {}).get("function"))
+            fn = n.get("function", {}).get("function")
+            functions.append(id(getattr(fn, "__func__", fn)))
         elif t == "definition-ref":
             n = definitions.get(n.get("schema_ref", ""))
             continue
         elif t not in _WRAPPERS:
-            return None, False
+            return None, functions
         n = n.get("schema")
-    return None, False
+    return None, functions
+
+
+def _own_wrapper_chain(cls: type) -> list[int] | None:
+    """The outer wrapper sequence pydantic emits for `cls` in `cls`'s own schema, or None if unclear."""
+    schema = getattr(cls, "__pydantic_core_schema__", None)
+    if schema is None:
+        return None
+    node, chain = _outer_wrappers(schema, _definitions(schema))
+    return chain if node is not None and node["cls"] is cls else None
+
+
+def _adapted_model_behind(
+    node: dict[str, Any],
+    definitions: dict[str, dict[str, Any]],
+    adapters: Mapping[type, ProjectionAdapter],
+    own_chains: dict[type, list[int] | None],
+) -> tuple[dict[str, Any] | None, bool]:
+    """The `model` node behind `node`'s outer wrappers when its class has an adapter, and whether the
+    adapter vouches for those wrappers.
+
+    The adapter speaks for exactly the wrappers pydantic emits for the class's own validators, and for
+    nothing else. Two things must hold. Every wrapper must be a registered model validator of the class,
+    so a function installed from outside -- through `__get_pydantic_core_schema__`, say -- is refused.
+    And the sequence must be *equal* to the one the class's own schema carries, not merely drawn from
+    it: an `Annotated[Cls, BeforeValidator(Cls.registered_validator)]` on somebody's field reuses a
+    registered function but adds a wrapper, and that second pass reads a shape the adapter never
+    described. Anything extra makes the node opaque.
+
+    Returns `(None, False)` when there is no adapted model behind the wrappers, and `(node, False)` when
+    there is one but the wrapper chain is not the class's own. `own_chains` caches the reference chain
+    per class for the duration of one derivation.
+    """
+    behind, chain = _outer_wrappers(node, definitions)
+    if behind is None or behind["cls"] not in adapters:
+        return None, False
+    cls = behind["cls"]
+    if cls not in own_chains:
+        own_chains[cls] = _own_wrapper_chain(cls)
+    registered = _own_model_validators(cls)
+    return behind, chain == own_chains[cls] and all(fn in registered for fn in chain)
 
 
 def _subtree_models(node: Any, definitions: dict[str, dict[str, Any]]) -> Iterator[dict[str, Any]]:
@@ -506,6 +537,7 @@ def _derive_spec(
     wrapper_kind: list[str] = []
     foreign: list[tuple[str, type]] = []  # (wrapper kind, adapted class) for wrappers it does not own
     derived: set[type] = set()  # classes this call has already derived, for real or to discard
+    own_chains: dict[type, list[int] | None] = {}  # each adapted class's own outer wrapper sequence
 
     def opaque(node: dict[str, Any], seen: frozenset[type]) -> bool:
         """Keep this subtree whole, and derive the adapted classes in it for their errors alone.
@@ -541,7 +573,7 @@ def _derive_spec(
             target = definitions.get(node["schema_ref"])
             return opaque(node, seen) if target is None else spec_for(target, seen)
         if t in _OPAQUE_WRAPPERS:
-            behind, owned = _adapted_model_behind(node, definitions, adapters)
+            behind, owned = _adapted_model_behind(node, definitions, adapters, own_chains)
             if owned and behind is not None:
                 # one of the class's own registered model validators; its adapter says what it reads
                 return spec_for(behind, seen)

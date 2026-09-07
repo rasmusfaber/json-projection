@@ -196,12 +196,14 @@ an excluded key from the inputs it was given. `examples/inspect_adapters.py` hol
   model whose own fields sit behind a `model_validator(mode='before')`, `'wrap'` or `'plain'` cannot be
   projected at all: `Projected` and `projection_spec` raise `TypeError`. Register a projection adapter for
   the class (see "Migration validators") to project through a before or wrap validator; a plain validator
-  cannot be adapted, so use `projected_validator` alone. An adapter vouches only for the class's *own
-  registered model validators* -- `@classmethod`, `@staticmethod` and inherited ones alike. A validator
-  installed from outside the class stays opaque even when it is a bound method of the adapted class: a
-  field validator on the enclosing model, or an `Annotated[Cls, BeforeValidator(...)]` on a field. At the
-  root such a wrapper raises `TypeError` saying so, rather than asking for the adapter you already
-  registered.
+  cannot be adapted, so use `projected_validator` alone. An adapter vouches for *exactly the wrappers
+  pydantic emits for the class's own registered model validators* -- `@classmethod`, `@staticmethod` and
+  inherited ones alike -- and for nothing else. A validator installed from outside the class stays opaque
+  even when it is a bound method of the adapted class, and even when it reuses one of the class's own
+  registered validators: an `Annotated[Cls, BeforeValidator(Cls.migrate)]` on somebody's field runs that
+  migration a second time, over a shape the adapter never described. A field validator on the enclosing
+  model is the same story. At the root such a wrapper raises `TypeError` saying so, rather than asking
+  for the adapter you already registered.
 - **After validators and excluded required fields.** A `model_validator(mode='after')` that touches an excluded
   required field raises `AttributeError` from `validate_json`, not a `ValidationError`.
 - **Extras.** A model with `extra='allow'` that has no excluded field of its own is kept whole (nothing below it

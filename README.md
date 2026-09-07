@@ -1,8 +1,9 @@
 # json-projection
 
 Strip the parts of a JSON document you do not want **before** a parser or validator sees them.
-Kept members are copied byte-for-byte; everything else is skipped by [jiter](https://github.com/pydantic/jiter)'s
-cursor without ever being parsed. Zero runtime dependencies. Optional [pydantic](https://docs.pydantic.dev) integration
+Kept members are copied byte-for-byte; unwanted values are scanned without constructing them.
+Whole-buffer projection uses [jiter](https://github.com/pydantic/jiter)'s cursor; streaming projection uses an
+incremental Rust scanner. Zero runtime dependencies. Optional [pydantic](https://docs.pydantic.dev) integration
 that excludes fields on any model, including models from libraries you do not control.
 
 ## Why
@@ -37,6 +38,52 @@ p(raw)  # keep items[*].id and name
 A spec is a set of root keys, or a mapping where a key maps to `True` (keep the whole value), a nested mapping
 (descend into an object) or `{"__all__": spec}` (apply to each array element). Everything not named is dropped.
 
+### Streaming input
+
+Use `Projection.stream()` to process one JSON object in binary chunks:
+
+```python
+from json_projection import Projection
+
+projection = Projection({"id", "scores"})
+session = projection.stream()
+with open("sample.json", "rb") as source:
+    while True:
+        chunk = source.read(64 * 1024)
+        if not chunk:
+            break
+        session.feed(chunk)
+projected = session.finish()
+```
+
+`feed(chunk: bytes)` returns `None` and consumes the chunk without retaining it. Empty chunks are allowed;
+other input types raise `TypeError`. `finish()` verifies that the complete document has arrived and returns
+the projected `bytes`, ready for `json.loads()` or a model's ordinary `model_validate_json()` call. Callers
+provide their own file, network, or async iteration; the session performs no I/O.
+
+The same projection can create independent, interleaved sessions. A session owns its shared selection plan
+and remains usable after the `Projection` is dropped. Each session handles exactly one root object and
+cannot be reused after `finish()` or a JSON error. Construct sessions with `Projection.stream()`; the exported
+`ProjectionStream` type has no public constructor.
+
+Streaming always raises `ValueError` for malformed JSON, including malformed discarded values, non-object
+roots, trailing non-whitespace input, or incomplete input at `finish()`. Errors include a zero-based byte
+offset in the original input, independent of chunk boundaries. Subsequent calls on a finished or failed
+session raise `RuntimeError`. A `TypeError` from passing a non-bytes chunk leaves an active session usable.
+There is no invalid-input passthrough: the original discarded bytes are no longer available.
+
+Selection rules, duplicate-member order, raw key/value spelling, and `NaN`/`Infinity` support match
+whole-buffer projection. Streaming limits nesting to **200 containers including the root**, across retained
+and discarded data. Escapes, surrogate pairs, control characters, and number grammar are checked everywhere;
+raw UTF-8 is checked when decoding keys for selection. Raw UTF-8 in value strings and in keys inside wholly
+copied or discarded subtrees is left to the downstream parser, matching the whole-buffer scanner.
+
+Discarded strings, numbers, and containers are never buffered in full. Memory is used for the caller's chunk,
+the nesting stack, the longest lookup key, and the **retained JSON output**. The output is buffered until
+`finish()`; creating the returned Python bytes briefly requires a second output buffer. Keeping most of a
+large document therefore still takes substantial memory. See the [streaming benchmarks](benchmarks/stream-results.md)
+for measured CPU and memory tradeoffs.
+
 ### With pydantic
 
 ```python
@@ -55,11 +102,12 @@ set means the root model.
 - **Error payloads show the projected document.** A `ValidationError` on a whole object reports the input
   without the dropped members.
 - **UTF-8 inside dropped data is not validated.** Escapes, control characters, numbers and nesting still are.
-- **Nesting depth is not accounted globally.** Every dropped or kept member starts a fresh nesting budget
+- **Whole-buffer nesting depth is not accounted globally.** Every dropped or kept member starts a fresh nesting budget
   of 200 below the member that holds it, and the containers the projector descends through cost nothing,
   so a document can be accepted at any total depth where pydantic alone rejects it for exceeding its
-  recursion limit. What comes out is still bounded by pydantic's own parse of the kept members.
-- **Kept data is copied once.** When little can be dropped, or a huge string sits under a dropped key, the copy
+  recursion limit. What comes out is still bounded by pydantic's own parse of the kept members. Streaming
+  instead enforces its global limit of 200 containers.
+- **Kept data is copied.** When little can be dropped, or a huge string sits under a dropped key, the copy
   costs more than it saves (see the last benchmark row).
 - **Partial instances:** a model with excluded required fields should not also appear inside a union; the
   serializer warns about the missing fields there.
@@ -105,6 +153,7 @@ set means the root model.
 
 On invalid JSON, or a root that is not an object, `project` returns the input unchanged so that whatever
 parses it next reports the error at the original position. Pass `strict=True` to raise `ValueError` instead.
+Streaming sessions always raise on errors, as described above.
 
 ## Supported
 

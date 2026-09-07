@@ -807,3 +807,32 @@ def test_a_custom_init_under_a_field_named_like_a_data_key_is_refused():
     ):
         with pytest.raises(ValueError, match="its own __init__"):
             build()
+
+
+def test_by_name_is_refused_while_the_projection_is_incomplete():
+    Child = _child()
+
+    class Outer(BaseModel):
+        child: Child  # type: ignore[valid-type]
+
+        @field_validator("child", mode="before")
+        @classmethod
+        def identity(cls, value):
+            return value
+
+    thin = Projected(Outer, {Child: {"secret"}})
+    raw = b'{"child":{"keep":1,"secret":9}}'
+    for kwargs in ({"by_name": True}, {"by_alias": False}):
+        with pytest.raises(ValueError, match="by name"):
+            thin.validate_json(raw, **kwargs)  # type: ignore[arg-type]
+    assert thin.validate_json(raw).child.secret == 0
+
+
+def test_by_name_is_forwarded_when_the_projection_is_complete():
+    class M(BaseModel):
+        keep: int = Field(validation_alias="Keep")
+        secret: int = 0
+
+    thin = Projected(M, {"secret"})
+    out = thin.validate_json(b'{"keep":1,"secret":9}', by_name=True)
+    assert out.keep == 1 and out.secret == 0

@@ -6,7 +6,7 @@ Requires the ``pydantic`` extra: ``pip install 'json-projection[pydantic]'``.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any, Union, cast
 
@@ -185,26 +185,35 @@ def _adapted_model_behind(
     return None, False
 
 
-def _reaches_excluded(
-    node: dict[str, Any], definitions: dict[str, dict[str, Any]], excluded: dict[type, frozenset[str]]
-) -> bool:
-    """Whether an excluded class has a `model` node at or below `node`, following each ref once."""
-    hit = [False]
+def _subtree_models(node: Any, definitions: dict[str, dict[str, Any]]) -> Iterator[dict[str, Any]]:
+    """Every `model` node at or below `node`, following each `definition-ref` once.
+
+    Lazy, so a caller that only asks whether some class is down there stops at the first hit.
+    """
     refs: set[str] = set()
     pending = [node]
+    found: list[dict[str, Any]] = []
 
     def look(n: dict[str, Any]) -> None:
-        if n.get("type") == "model" and excluded.get(n["cls"]):
-            hit[0] = True
+        if n.get("type") == "model":
+            found.append(n)
         ref = n.get("schema_ref")
         if isinstance(ref, str) and ref not in refs:
             refs.add(ref)
             if ref in definitions:
                 pending.append(definitions[ref])
 
-    while pending and not hit[0]:
+    while pending:
         _walk(pending.pop(), look)
-    return hit[0]
+        yield from found
+        found.clear()
+
+
+def _reaches_excluded(
+    node: dict[str, Any], definitions: dict[str, dict[str, Any]], excluded: dict[type, frozenset[str]]
+) -> bool:
+    """Whether an excluded class has a `model` node at or below `node`, following each ref once."""
+    return any(excluded.get(n["cls"]) for n in _subtree_models(node, definitions))
 
 
 def projected_validator(
@@ -555,6 +564,15 @@ def _derive_spec(
         return opaque(node)  # dict, unions, fixed tuples, dataclasses, TypedDicts, Any, scalars
 
     root = spec_for(schema, frozenset())
+    in_schema = {n["cls"] for n in _subtree_models(schema, definitions)}
+    absent = [cls for cls in adapters if cls not in in_schema]
+    if absent:
+        names = ", ".join(sorted(cls.__qualname__ for cls in absent))
+        raise ValueError(
+            f"projection adapter registered for {names}, which does not appear in the schema of "
+            f"{model.__qualname__}; adapters are looked up by exact class, so a subclass needs its "
+            "own entry"
+        )
     if not isinstance(root, dict):
         if _extra(model) == "allow" and not excluded.get(model):
             raise TypeError(
@@ -593,7 +611,8 @@ def projection_spec(
     """Derive the keep-spec for `model` minus the excluded fields from its core schema.
 
     `projection_adapters` maps classes to adapters that say what their before/wrap validators read
-    (see `ProjectionAdapter` and `migration_adapter`).
+    (see `ProjectionAdapter` and `migration_adapter`). Lookup is by exact class, and an adapter for a
+    class absent from the schema is a `ValueError`.
     """
     return _derive_spec(model, normalize_exclude(model, exclude), dict(projection_adapters or {}))[0]
 
@@ -615,6 +634,10 @@ class Projected:
     validators: a validator installed from outside -- a field validator on the enclosing model, an
     ``Annotated`` validator, even one that is a bound method of the adapted class -- keeps the class
     opaque. Such classes keep the guards on when exclusion touches them.
+
+    Adapters are looked up by exact class, so a subclass needs its own entry, and an adapter for a class
+    that has no ``model`` node in ``model``'s schema is a ``ValueError``: silently unused knowledge is
+    how a projection quietly stops matching the validators it was written for.
     """
 
     def __init__(

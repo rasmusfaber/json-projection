@@ -150,6 +150,10 @@ thin = Projected(
 class and must be pure. The validators themselves still perform the migration; the projection only makes
 sure they see what they need.
 
+Adapters are looked up by **exact class**: a subclass needs its own entry, and registering one for a class
+that does not appear in the root model's schema raises `ValueError` rather than going silently unused. The
+same adapter object can of course be registered under several classes.
+
 Adapted classes keep the config guards on (see "Refused configurations") because a migration can recreate
 an excluded key from the inputs it was given. `examples/inspect_adapters.py` holds adapters for inspect_ai's
 `EvalLog`.

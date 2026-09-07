@@ -9,7 +9,9 @@ from pydantic_core import core_schema
 
 from json_projection.pydantic import AdapterContext, Projected, _keep_path, migration_adapter, projection_spec
 from migration_models import ADAPTERS as MIGRATION_ADAPTERS
-from migration_models import Item, Log, Sample
+from migration_models import SAMPLE_ADAPTER, Item, Log, Sample
+
+SAMPLE_ONLY = {Sample: SAMPLE_ADAPTER}  # adapters are refused for classes a root's schema lacks
 
 
 class Legacy(BaseModel):
@@ -158,14 +160,12 @@ def test_a_field_validator_on_an_adapted_class_stays_opaque():
 
 
 def test_inputs_are_kept_only_for_retained_fields():
-    spec = projection_spec(Sample, {"events", "timelines"}, projection_adapters=MIGRATION_ADAPTERS)
+    spec = projection_spec(Sample, {"events", "timelines"}, projection_adapters=SAMPLE_ONLY)
     assert spec["score"] is True and spec["transcript"] == {"content": True}
     assert "events" not in spec and "timelines" not in spec
-    spec = projection_spec(
-        Sample, {"events", "timelines", "attachments"}, projection_adapters=MIGRATION_ADAPTERS
-    )
+    spec = projection_spec(Sample, {"events", "timelines", "attachments"}, projection_adapters=SAMPLE_ONLY)
     assert "transcript" not in spec and spec["score"] is True
-    spec = projection_spec(Sample, {"scores"}, projection_adapters=MIGRATION_ADAPTERS)
+    spec = projection_spec(Sample, {"scores"}, projection_adapters=SAMPLE_ONLY)
     assert "score" not in spec and spec["transcript"] == {"events": True, "content": True}
 
 
@@ -207,12 +207,12 @@ def test_migration_adapter_rejects_bad_paths():
 
 def test_a_dependency_on_an_excluded_field_is_a_conflict():
     with pytest.raises(ValueError, match="retaining 'timelines' requires 'events', which is excluded"):
-        Projected(Sample, {"events"}, projection_adapters=MIGRATION_ADAPTERS)
-    Projected(Sample, {"events", "timelines"}, projection_adapters=MIGRATION_ADAPTERS)  # both gone: fine
+        Projected(Sample, {"events"}, projection_adapters=SAMPLE_ONLY)
+    Projected(Sample, {"events", "timelines"}, projection_adapters=SAMPLE_ONLY)  # both gone: fine
 
 
 def test_an_emptied_legacy_object_keeps_its_presence():
-    thin = Projected(Sample, {"events", "timelines"}, projection_adapters=MIGRATION_ADAPTERS)
+    thin = Projected(Sample, {"events", "timelines"}, projection_adapters=SAMPLE_ONLY)
     doc = b'{"id": 1, "transcript": {"events": [{"id": 9, "blob": {}}]}, "attachments": {"stale": "x"}}'
     assert json.loads(thin.spec(doc)) == {"id": 1, "transcript": {}, "attachments": {"stale": "x"}}
     # the (now empty) transcript still overwrites attachments, exactly as in plain validation
@@ -220,7 +220,7 @@ def test_an_emptied_legacy_object_keeps_its_presence():
 
 
 def test_legacy_inputs_reach_the_migration():
-    thin = Projected(Sample, {"store"}, projection_adapters=MIGRATION_ADAPTERS)
+    thin = Projected(Sample, {"store"}, projection_adapters=SAMPLE_ONLY)
     doc = (
         b'{"id": 1, "score": 0.5, "store": {"big": [1, 2, 3]},'
         b' "timelines": [{"name": "t", "event_ids": [9]}],'
@@ -290,3 +290,29 @@ class ForeignWrapped(BaseModel):
 def test_a_foreign_wrapper_at_the_root_says_so_instead_of_asking_for_an_adapter():
     with pytest.raises(TypeError, match="not one of ForeignWrapped's own model validators"):
         Projected(ForeignWrapped, {"junk"}, projection_adapters={ForeignWrapped: migration_adapter()})
+
+
+def test_an_adapter_for_a_class_the_schema_lacks_is_refused():
+    with pytest.raises(ValueError, match="Log, which does not appear in the schema of Sample"):
+        projection_spec(Sample, {"store"}, projection_adapters=MIGRATION_ADAPTERS)
+
+
+class Base(BaseModel):
+    a: int = 0
+
+
+class Sub(Base):
+    b: int = 0
+
+
+class SubHolder(BaseModel):
+    sub: Sub
+
+
+def test_an_adapter_is_looked_up_by_exact_class():
+    control = migration_adapter(controls=["ctl"])
+    with pytest.raises(ValueError, match="Base, which does not appear in the schema of SubHolder"):
+        projection_spec(SubHolder, {Sub: {"b"}}, projection_adapters={Base: control})
+    assert projection_spec(SubHolder, {Sub: {"b"}}, projection_adapters={Sub: control}) == {
+        "sub": {"a": True, "ctl": True}
+    }

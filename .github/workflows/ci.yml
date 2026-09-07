@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+        env:
+          PYO3_PYTHON: python
+      - run: cargo test
+        env:
+          PYO3_PYTHON: python
+
+  python:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.13"]
+        pydantic: ["pydantic==2.13.0", "pydantic"]
+        include:
+          - os: ubuntu-latest
+            python: "3.13"
+            pydantic: '--prerelease=allow "pydantic>2.13"'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python }}
+      # uv sync builds and installs the extension through maturin (release profile); no separate develop step
+      - run: uv sync --group dev --python ${{ matrix.python }}
+      # override the locked pydantic; every later command uses --no-sync so uv does not restore the lock
+      - run: uv pip install ${{ matrix.pydantic }}
+        shell: bash
+      - run: uv run --no-sync python -c "import pydantic, pydantic_core; print(pydantic.VERSION, pydantic_core.__version__)"
+      - run: uv run --no-sync ruff check . && uv run --no-sync ruff format --check .
+      - run: uv run --no-sync pytest -q

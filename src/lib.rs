@@ -1,11 +1,15 @@
 mod spec;
+mod stream;
 mod walk;
 
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use std::sync::{Arc, OnceLock};
+
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyMemoryView, PyString};
 
 use crate::spec::Spec;
+use crate::stream::{Engine, Error as StreamError, StreamPlan};
 use crate::walk::{project_bytes, WalkError};
 
 /// Coerce the accepted input types to `bytes`: `bytes` as-is (so passthrough returns the identical object),
@@ -55,6 +59,7 @@ fn run<'py>(
 pub struct Projection {
     spec: Spec,
     repr: String,
+    stream_plan: OnceLock<Arc<StreamPlan>>,
 }
 
 #[pymethods]
@@ -64,6 +69,7 @@ impl Projection {
         Ok(Projection {
             spec: Spec::from_py_root(spec)?,
             repr: format!("Projection({})", spec.repr()?),
+            stream_plan: OnceLock::new(),
         })
     }
 
@@ -91,6 +97,47 @@ impl Projection {
     fn __repr__(&self) -> &str {
         &self.repr
     }
+
+    /// Start an independent, strict streaming projection of one JSON object.
+    fn stream(&self) -> ProjectionStream {
+        let plan = self
+            .stream_plan
+            .get_or_init(|| Arc::new(StreamPlan::new(&self.spec)));
+        ProjectionStream {
+            engine: Engine::new(plan.clone()),
+        }
+    }
+}
+
+/// A single JSON document, fed in binary chunks. Construct with `Projection.stream()`.
+#[pyclass(module = "json_projection")]
+pub struct ProjectionStream {
+    engine: Engine,
+}
+
+#[pymethods]
+impl ProjectionStream {
+    /// Consume a binary chunk without retaining it. Malformed JSON raises ValueError.
+    fn feed(&mut self, chunk: &Bound<'_, PyBytes>) -> PyResult<()> {
+        self.engine.feed(chunk.as_bytes()).map_err(stream_error)
+    }
+
+    /// Finish the document and return its projected bytes. The session cannot be reused.
+    fn finish<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let output = self.engine.finish().map_err(stream_error)?;
+        Ok(PyBytes::new(py, &output))
+    }
+}
+
+fn stream_error(error: StreamError) -> PyErr {
+    match error {
+        StreamError::Parse { offset, message } => {
+            PyValueError::new_err(format!("invalid JSON at byte {offset}: {message}"))
+        }
+        StreamError::Closed => {
+            PyRuntimeError::new_err("projection stream is already finished or failed")
+        }
+    }
 }
 
 /// One-shot projection: compile `spec` and apply it to `data`.
@@ -109,6 +156,7 @@ fn project<'py>(
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<Projection>()?;
+    m.add_class::<ProjectionStream>()?;
     m.add_function(wrap_pyfunction!(project, m)?)?;
     Ok(())
 }

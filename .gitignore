@@ -1,1 +1,11 @@
+/target/
+/.venv/
+/dist/
+/wheelhouse/
+__pycache__/
+*.pyc
+*.so
+*.pyd
+.pytest_cache/
+.ruff_cache/
 /docs/superpowers/plans/

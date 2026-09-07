@@ -129,3 +129,18 @@ def test_spec_nesting_is_capped():
         deep = {"k": deep}
     with pytest.raises(TypeError, match="nesting"):
         project(b"{}", deep)
+
+
+def test_a_mapping_that_mutates_the_spec_while_it_compiles_does_not_panic():
+    spec: dict[str, Any] = {}
+
+    class Mutator:
+        def keys(self):
+            spec["added"] = True  # mutates the dict whose iteration produced this value
+            return []
+
+        def __getitem__(self, key):
+            raise AssertionError("no keys to fetch")
+
+    spec["x"] = Mutator()
+    assert isinstance(project(b'{"x": 1, "added": 2}', spec), bytes)

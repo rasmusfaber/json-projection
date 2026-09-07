@@ -67,8 +67,11 @@ impl Spec {
                     )?)));
                 }
             }
-            let mut map = HashMap::with_capacity(dict.len());
-            for (k, v) in dict.iter() {
+            // snapshot the entries: converting a value can run Python (a custom mapping's `keys`),
+            // and mutating the dict while its iterator is live panics inside pyo3
+            let items: Vec<_> = dict.iter().collect();
+            let mut map = HashMap::with_capacity(items.len());
+            for (k, v) in items {
                 let key = k
                     .cast::<PyString>()
                     .map_err(|_| PyTypeError::new_err("spec keys must be str"))?

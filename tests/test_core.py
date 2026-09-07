@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 
 from json_projection import Projection, project
-from reference import corpus, reference_project
+from reference import Obj, canon, corpus, parse, reference_project
 
 
 def test_project_root_keys_from_set():
@@ -85,15 +85,32 @@ def test_non_dict_mapping_spec_is_honoured():
     assert out == b'{"a": {"x": 1}}'
 
 
-def _canon(obj):
-    return json.dumps(obj, sort_keys=True)  # NaN/Infinity serialise as literals, so they compare equal
-
-
 @pytest.mark.parametrize("seed", [1, 2, 3])
 def test_matches_reference_on_generated_corpus(seed):
     for raw, spec in corpus(seed, 1500):
         out = project(raw, spec)
-        assert _canon(json.loads(out)) == _canon(reference_project(json.loads(raw), spec)), (raw, spec)
+        assert canon(parse(out)) == canon(reference_project(parse(raw), spec)), (raw, spec)
+
+
+def _has_duplicate_key(node):
+    if isinstance(node, Obj):
+        return len({k for k, _ in node}) < len(node) or any(_has_duplicate_key(v) for _, v in node)
+    if isinstance(node, list):
+        return any(_has_duplicate_key(v) for v in node)
+    return False
+
+
+def _has_nested_all(spec):
+    if not isinstance(spec, dict):
+        return False
+    inner = spec.get("__all__")
+    return (isinstance(inner, dict) and "__all__" in inner) or any(_has_nested_all(v) for v in spec.values())
+
+
+def test_corpus_covers_duplicate_keys_and_arrays_of_arrays_of_objects():
+    docs = corpus(1, 1500)
+    assert sum(_has_duplicate_key(parse(raw)) for raw, _ in docs) > 50
+    assert sum(_has_nested_all(spec) for _, spec in docs) > 50
 
 
 def test_self_referential_spec_is_rejected():

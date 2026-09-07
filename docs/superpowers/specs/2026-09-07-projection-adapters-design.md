@@ -200,7 +200,9 @@ declared key, and a kept value whose shape does not match its sub-spec is copied
 
 ## Testing
 
-All in `tests/test_pydantic.py` unless noted.
+Adapter tests live in `tests/test_adapters.py`, the correctness property in `tests/test_migrations.py`
+(models, generator and `retained_dump` in `tests/migration_models.py`), and the optional inspect_ai
+round-trip in `tests/test_inspect_ai.py`; `tests/test_pydantic.py` is unchanged.
 
 - **Property test (the correctness statement)**, in `tests/test_migrations.py`. A synthetic model family
   in `tests/migration_models.py`:
@@ -244,11 +246,11 @@ All in `tests/test_pydantic.py` unless noted.
 
 ## Documentation
 
-- README: a "Migration validators" section with the inspect_ai example, the adapter contract in a few
-  lines, and the `migration_adapter` relationships table (retained field -> inputs; controls;
-  requires). The 0.1 bullet "Before/wrap/plain validators are not projected through" gains "unless a
-  projection adapter is registered for the class". The "Standalone `projected_validator`" bullet notes
-  that adapters do not affect it.
+- README: a "Migration validators" section with the adapter contract in a few lines, a `migration_adapter`
+  example with `inputs`, `controls` and `requires` commented inline, the dependency-conflict sentence, and
+  a pointer to `examples/inspect_adapters.py`. The 0.1 bullet "Before/wrap/plain validators are not
+  projected through" gains "unless a projection adapter is registered for the class". The "Standalone
+  `projected_validator`" bullet notes that adapters do not affect it.
 - CHANGELOG: 0.2.0 entry (adapters, `migration_adapter`, `AdapterContext`, message change).
 - `Cargo.toml` version 0.2.0.
 

@@ -54,7 +54,7 @@ fn run<'py>(
     }
 }
 
-/// A compiled keep-spec. Build once, apply to many documents.
+/// A compiled member projection. Build once, apply to many documents.
 #[pyclass(frozen, module = "json_projection")]
 pub struct Projection {
     spec: Spec,
@@ -73,7 +73,17 @@ impl Projection {
         })
     }
 
-    /// Return `data` with every member not named in the spec removed.
+    /// Compile member exclusions, keeping every unspecified member whole.
+    #[staticmethod]
+    fn excluding(spec: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Projection {
+            spec: Spec::from_py_excluding(spec)?,
+            repr: format!("Projection.excluding({})", spec.repr()?),
+            stream_plan: OnceLock::new(),
+        })
+    }
+
+    /// Apply the compiled inclusion or exclusion rules to `data`.
     #[pyo3(signature = (data, *, strict = false))]
     fn apply<'py>(
         &self,

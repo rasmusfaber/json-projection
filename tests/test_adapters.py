@@ -4,6 +4,7 @@ import functools
 import json
 import time
 from collections import Counter, UserDict
+from collections.abc import Iterator
 from types import MappingProxyType
 from typing import Annotated, Any, Literal, Optional, Union
 
@@ -152,6 +153,36 @@ def test_an_adapted_class_unrelated_to_exclusions_stays_complete():
     thin = Projected(Holder, {Holder: {"junk"}}, projection_adapters=ADAPTERS)
     assert thin.complete is True
     assert thin.validate_json(b'{"legacy": ' + LEGACY_DOC + b"}").legacy.name == "n"
+
+
+def test_projection_plan_reports_migration_recreation_separately_from_retained_bytes():
+    plan = json_projection.pydantic.projection_plan(
+        Holder, {Legacy: {"payload"}}, projection_adapters=ADAPTERS
+    )
+    assert "payload" not in plan.spec["legacy"]
+    assert plan.complete is False and len(plan.fallbacks) == 1
+    fallback = plan.fallbacks[0]
+    assert fallback.path == ("legacy",)
+    assert fallback.exclusions == {Legacy: frozenset({"payload"})}
+    assert "migration" in fallback.reason and "recreate" in fallback.reason
+
+
+def test_projection_plan_reports_the_foreign_wrapper_boundary_only():
+    plan = json_projection.pydantic.projection_plan(
+        FieldValidated, {Legacy: {"payload"}}, projection_adapters=ADAPTERS
+    )
+    assert plan.spec["legacy"] is True
+    assert plan.complete is False and len(plan.fallbacks) == 1
+    assert plan.fallbacks[0].path == ("legacy",)
+    assert "function-before" in plan.fallbacks[0].reason
+
+
+def test_projection_plan_keeps_adapter_dependency_errors_under_opaque_subtrees():
+    bad = migration_adapter(requires={"name": ["payload"]})
+    with pytest.raises(ValueError, match="retaining 'name' requires 'payload'"):
+        json_projection.pydantic.projection_plan(
+            FieldValidated, {Legacy: {"payload"}}, projection_adapters={Legacy: bad}
+        )
 
 
 def test_repr_lists_adapted_classes():
@@ -589,20 +620,21 @@ def test_many_fields_on_one_colliding_key_stay_linear(monkeypatch: pytest.Monkey
     many = create_model("Many", **fields)  # type: ignore[call-overload]
 
     walks = [0]
-    real = json_projection.pydantic._reaches_excluded
+    real = json_projection.pydantic._subtree_models
 
-    def counting(*args: Any) -> bool:
+    def counting(*args: Any) -> Iterator[dict[str, Any]]:
         walks[0] += 1
         return real(*args)
 
-    monkeypatch.setattr(json_projection.pydantic, "_reaches_excluded", counting)
+    monkeypatch.setattr(json_projection.pydantic, "_subtree_models", counting)
     start = time.perf_counter()
     spec = projection_spec(many, set())
     elapsed = time.perf_counter() - start
 
     # the field name is a key of its own beside the alias, so each field keeps its own sub-spec
     assert spec == {"x": True, **{f"f{i}": {"v": True} for i in range(n)}}
-    assert walks[0] <= 2 * n + 10, walks[0]  # one pass per contributor, not one per pair
+    # Each field visits its scalar and colliding alias, with two subtree passes per boundary.
+    assert n <= walks[0] <= 4 * n + 10, walks[0]
     assert elapsed < 0.1
 
 

@@ -9,8 +9,12 @@ use pyo3::types::{PyBool, PyDict, PyString};
 pub enum Spec {
     /// Copy the value as raw bytes.
     Keep,
+    /// Remove the object member holding this value.
+    Discard,
     /// The value is an object: keep listed members (each with its own spec), drop the rest.
     Object(HashMap<String, Spec>),
+    /// The value is an object: apply listed member rules, keep the rest whole.
+    ExcludeObject(HashMap<String, Spec>),
     /// The value is an array: apply the inner spec to every element.
     Array(Box<Spec>),
 }
@@ -25,15 +29,28 @@ const MAX_DEPTH: usize = 256;
 impl Spec {
     /// Compile a root spec: an iterable of `str`, or a mapping. The root always describes an object.
     pub fn from_py_root(obj: &Bound<'_, PyAny>) -> PyResult<Spec> {
-        match Self::from_py(obj, true, 0)? {
-            spec @ Spec::Object(_) => Ok(spec),
+        Self::from_py_root_mode(obj, false)
+    }
+
+    pub fn from_py_excluding(obj: &Bound<'_, PyAny>) -> PyResult<Spec> {
+        Self::from_py_root_mode(obj, true)
+    }
+
+    fn from_py_root_mode(obj: &Bound<'_, PyAny>, excluding: bool) -> PyResult<Spec> {
+        match Self::from_py(obj, true, 0, excluding)? {
+            spec @ (Spec::Object(_) | Spec::ExcludeObject(_)) => Ok(spec),
             _ => Err(PyTypeError::new_err(
                 "the root spec must be a set of keys or a mapping describing an object",
             )),
         }
     }
 
-    fn from_py(obj: &Bound<'_, PyAny>, root: bool, depth: usize) -> PyResult<Spec> {
+    fn from_py(
+        obj: &Bound<'_, PyAny>,
+        root: bool,
+        depth: usize,
+        excluding: bool,
+    ) -> PyResult<Spec> {
         if depth > MAX_DEPTH {
             return Err(PyTypeError::new_err(format!(
                 "spec nesting exceeds {MAX_DEPTH} levels"
@@ -41,7 +58,7 @@ impl Spec {
         }
         if let Ok(b) = obj.cast::<PyBool>() {
             if b.is_true() && !root {
-                return Ok(Spec::Keep);
+                return Ok(if excluding { Spec::Discard } else { Spec::Keep });
             }
             return Err(PyTypeError::new_err(
                 "spec values must be True, a mapping, or {\"__all__\": spec}",
@@ -50,7 +67,7 @@ impl Spec {
         if !obj.is_instance_of::<PyDict>() && obj.hasattr("keys")? {
             // any other Mapping (MappingProxyType, custom mappings): compile once through a dict copy
             let as_dict = obj.py().get_type::<PyDict>().call1((obj,))?;
-            return Self::from_py(&as_dict, root, depth);
+            return Self::from_py(&as_dict, root, depth, excluding);
         }
         if let Ok(dict) = obj.cast::<PyDict>() {
             if dict.len() == 1 {
@@ -60,11 +77,13 @@ impl Spec {
                             "\"__all__\" is not allowed at the root; the root must be an object",
                         ));
                     }
-                    return Ok(Spec::Array(Box::new(Self::from_py(
-                        &inner,
-                        false,
-                        depth + 1,
-                    )?)));
+                    let child = Self::from_py(&inner, false, depth + 1, excluding)?;
+                    if matches!(child, Spec::Discard) {
+                        return Err(PyTypeError::new_err(
+                            "array element exclusion is not supported; exclude the containing member instead",
+                        ));
+                    }
+                    return Ok(Spec::Array(Box::new(child)));
                 }
             }
             // snapshot the entries: converting a value can run Python (a custom mapping's `keys`),
@@ -82,16 +101,20 @@ impl Spec {
                         "\"__all__\" cannot be combined with other keys",
                     ));
                 }
-                map.insert(key, Self::from_py(&v, false, depth + 1)?);
+                map.insert(key, Self::from_py(&v, false, depth + 1, excluding)?);
             }
-            return Ok(Spec::Object(map));
+            return Ok(if excluding {
+                Spec::ExcludeObject(map)
+            } else {
+                Spec::Object(map)
+            });
         }
         if obj.cast::<PyString>().is_ok() {
             return Err(PyTypeError::new_err(
                 "a spec must be an iterable of keys or a mapping, not a single str",
             ));
         }
-        // any other iterable: a collection of root keys, each kept whole
+        // Any other iterable names members, each kept or discarded whole.
         let iter = obj
             .try_iter()
             .map_err(|_| PyTypeError::new_err("a spec must be an iterable of keys or a mapping"))?;
@@ -103,9 +126,13 @@ impl Spec {
                 .map_err(|_| PyTypeError::new_err("spec keys must be str"))?
                 .to_cow()?
                 .into_owned();
-            map.insert(key, Spec::Keep);
+            map.insert(key, if excluding { Spec::Discard } else { Spec::Keep });
         }
-        Ok(Spec::Object(map))
+        Ok(if excluding {
+            Spec::ExcludeObject(map)
+        } else {
+            Spec::Object(map)
+        })
     }
 }
 

@@ -6,7 +6,7 @@ import random
 import pytest
 from pydantic import ValidationError
 
-from json_projection.pydantic import Projected
+from json_projection.pydantic import Projected, projection_plan
 from migration_models import ADAPTERS, Item, Log, Sample, document, retained_dump
 
 CANDIDATES = [
@@ -32,6 +32,7 @@ def test_projected_validation_matches_plain_validation_on_retained_fields(seed: 
             if rng.random() < 0.35:
                 excluded.setdefault(cls, set()).add(name)
         try:
+            plan = projection_plan(Log, excluded, projection_adapters=ADAPTERS)
             thin = Projected(Log, excluded, projection_adapters=ADAPTERS)
         except ValueError:
             # the only declared dependency: timelines need events
@@ -39,6 +40,7 @@ def test_projected_validation_matches_plain_validation_on_retained_fields(seed: 
             assert "events" in sample and "timelines" not in sample, excluded
             rejected += 1
             continue
+        assert plan.complete == thin.complete == (not plan.fallbacks)
         doc = json.dumps(document(rng)).encode()
         try:
             plain = Log.model_validate_json(doc)

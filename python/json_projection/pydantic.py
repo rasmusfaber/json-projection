@@ -8,11 +8,13 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from functools import lru_cache
+from types import MappingProxyType
 from typing import Any, Union, cast
 
 try:
     import pydantic
-    from pydantic import BaseModel
+    from pydantic import BaseModel, Field
     from pydantic_core import SchemaValidator
 except ImportError as e:  # pragma: no cover
     raise ImportError(
@@ -30,11 +32,22 @@ _EXCLUDED_ALIAS_PREFIX = "\x00excluded:"
 
 
 def normalize_exclude(model: type[BaseModel], exclude: Exclude) -> dict[type, frozenset[str]]:
-    if isinstance(exclude, str):  # an iterable of characters, never what the caller meant
-        raise TypeError("exclude must be a set of field names or a mapping {model: field names}, not a str")
-    if isinstance(exclude, Mapping):
-        return {cls: frozenset(names) for cls, names in cast("Mapping[type, Iterable[str]]", exclude).items()}
-    return {model: frozenset(exclude)}
+    """Normalise exclusion collections, rejecting malformed classes and field names."""
+    entries = exclude.items() if isinstance(exclude, Mapping) else ((model, exclude),)
+    normalized: dict[type, frozenset[str]] = {}
+    for cls, names in entries:
+        if not isinstance(cls, type) or not issubclass(cls, BaseModel):
+            raise TypeError(f"exclude keys must be pydantic model classes, not {cls!r}")
+        if isinstance(names, str):
+            raise TypeError("exclude must contain collections of field names, not a str")
+        try:
+            values = list(names)
+        except TypeError as exc:
+            raise TypeError("exclude must contain iterable collections of field names") from exc
+        if any(not isinstance(name, str) for name in values):
+            raise TypeError("exclude field names must be strings")
+        normalized[cls] = frozenset(values)
+    return normalized
 
 
 _DATA_KEYS = frozenset({"default", "metadata", "serialization", "json_schema_extra"})
@@ -247,6 +260,68 @@ def _reaches_excluded(
     return any(excluded.get(n["cls"]) for n in _subtree_models(node, definitions))
 
 
+def _validate_excluded(
+    model: type[BaseModel],
+    excluded: dict[type, frozenset[str]],
+    schema: dict[str, Any],
+    definitions: dict[str, dict[str, Any]],
+) -> None:
+    """Check names against the unedited schema, including children of excluded fields."""
+    present: set[tuple[type, str]] = set()
+    classes: set[type] = set()
+    for node in _subtree_models(schema, definitions):
+        cls = node["cls"]
+        classes.add(cls)
+        names = excluded.get(cls)
+        if names:
+            fields, _ = _fields_node(node, definitions)
+            if fields is not None:
+                present.update((cls, name) for name in names if name in fields["fields"])
+    absent = excluded.keys() - classes
+    if absent:
+        desc = ", ".join(sorted(cls.__qualname__ for cls in absent))
+        raise ValueError(f"model classes not found in the schema of {model.__qualname__}: {desc}")
+    missing = {(cls, name) for cls, names in excluded.items() for name in names} - present
+    if missing:
+        desc = ", ".join(sorted(f"{cls.__qualname__}.{name}" for cls, name in missing))
+        raise ValueError(f"fields not found in the schema of {model.__qualname__}: {desc}")
+
+
+@lru_cache(maxsize=1)
+def _check_prebuilt_support(validator_type: type[SchemaValidator]) -> None:
+    """Verify core-schema edits behaviorally once per validator implementation.
+
+    Formatting a user validator can expand shared schema references into megabytes of text. A small
+    repeated nested model instead checks that disabling prebuilt validators applies both required-field
+    removal and default-field alias edits, without depending on pydantic-core's debug representation.
+    """
+
+    class Probe(BaseModel):
+        required: int
+        defaulted: int = Field(default=1, validation_alias="legacy")
+
+    class Parent(BaseModel):
+        left: Probe
+        right: Probe
+
+    schema = _copy(Parent.__pydantic_core_schema__)
+
+    def edit(node: dict[str, Any]) -> None:
+        if node.get("type") == "model-fields" and "required" in node["fields"]:
+            node["fields"].pop("required")
+            node["fields"]["defaulted"]["validation_alias"] = _EXCLUDED_ALIAS_PREFIX + "defaulted"
+
+    _walk(schema, edit)
+    message = "pydantic-core reused a prebuilt validator; the exclusion would be ignored"
+    try:
+        validator = validator_type(schema, _use_prebuilt=False)
+        result = validator.validate_python({"left": {"legacy": 9}, "right": {"required": 2, "legacy": 3}})
+    except (pydantic.ValidationError, TypeError) as exc:
+        raise RuntimeError(message) from exc
+    if any(child.defaulted != 1 or "required" in child.__dict__ for child in (result.left, result.right)):
+        raise RuntimeError(message)
+
+
 def projected_validator(
     model: type[BaseModel], exclude: Exclude, *, assume_projected: bool = False
 ) -> SchemaValidator:
@@ -254,8 +329,10 @@ def projected_validator(
 
     Excluded fields with a default keep their default: their key becomes the alias
     ``\\x00excluded:<name>``, which no ordinary document contains, so a document that does contain that
-    literal key still populates the field (`Projected` strips it). Excluded required fields are absent
+    literal key still populates the field. Excluded required fields are absent
     from the resulting instances (and from ``model_fields_set``). Instances are of the original classes.
+    A retained field using an excluded defaulted field's synthetic alias is refused with ``ValueError``:
+    preserving its input would also populate the excluded field.
 
     With ``assume_projected=False`` (validating raw input) classes whose configuration would still let
     pydantic read an excluded key are refused with ``ValueError``: ``extra='forbid'`` or ``extra='allow'``,
@@ -271,23 +348,7 @@ def projected_validator(
     schema = _copy(model.__pydantic_core_schema__)
     definitions = _definitions(schema)
     config: list[Any] = []
-
-    # the names are validated against the unedited schema: removing a required field would hide the
-    # class it holds from the rest of the walk, and its own valid exclusions would look like typos
-    present: set[tuple[type, str]] = set()
-
-    def find(node: dict[str, Any]) -> None:
-        names = excluded.get(node["cls"]) if node.get("type") == "model" else None
-        if names:
-            fields, _ = _fields_node(node, definitions)
-            if fields is not None:
-                present.update((node["cls"], n) for n in names if n in fields["fields"])
-
-    _walk(schema, find)
-    missing = {(cls, n) for cls, names in excluded.items() for n in names} - present
-    if missing:
-        desc = ", ".join(f"{cls.__qualname__}.{n}" for cls, n in sorted(missing, key=str))
-        raise ValueError(f"fields not found in the schema of {model.__qualname__}: {desc}")
+    _validate_excluded(model, excluded, schema, definitions)
 
     def visit(node: dict[str, Any]) -> None:
         if node.get("type") != "model":
@@ -308,11 +369,24 @@ def projected_validator(
         fields, _ = _fields_node(node, definitions)
         if fields is None:
             return  # no fields of its own: a RootModel wraps another schema
+        retained_keys: dict[str, str] = {}
+        for kept_name, kept_field in fields["fields"].items():
+            if kept_name not in names:
+                for key, _ in _field_keys(kept_name, kept_field.get("validation_alias")):
+                    retained_keys.setdefault(key, kept_name)
         for name in names:
             field = fields["fields"].get(name)
             if field is None:
                 continue
             has_default = field["schema"].get("type") == "default"
+            if has_default:
+                kept_name = retained_keys.get(_EXCLUDED_ALIAS_PREFIX + name)
+                if kept_name is not None:
+                    raise ValueError(
+                        f"{cls.__qualname__}: retained field {kept_name!r} uses the synthetic alias "
+                        f"of excluded field {name!r}; preserving its input would populate the "
+                        "excluded field"
+                    )
             if not assume_projected:
                 extra = _extra(cls)
                 if extra == "forbid":
@@ -339,10 +413,8 @@ def projected_validator(
                 fields["fields"].pop(name)
 
     _walk(schema, visit)
-    validator = SchemaValidator(schema, config[0] if config else None, _use_prebuilt=False)
-    if "PrebuiltValidator" in repr(validator):
-        raise RuntimeError("pydantic-core reused a prebuilt validator; the exclusion would be ignored")
-    return validator
+    _check_prebuilt_support(SchemaValidator)
+    return SchemaValidator(schema, config[0] if config else None, _use_prebuilt=False)
 
 
 from json_projection import Projection  # noqa: E402  (after the import guard on purpose)
@@ -566,11 +638,45 @@ def migration_adapter(
     return adapter
 
 
+@dataclass(frozen=True)
+class ProjectionFallback:
+    """A boundary where exclusion cannot be proved, without running validation.
+
+    `path` uses model field names from the root, with `__all__` for array items; an empty path is the
+    root. It identifies the boundary, not every occurrence beneath it or a literal JSON path. Alias
+    reasons name the JSON key involved. `exclusions` is a read-only mapping of affected model classes
+    to their excluded field names. `reason` describes either a subtree kept whole or a migration that
+    may recreate excluded input keys before field validation. Boundaries unrelated to requested
+    exclusions are omitted.
+    """
+
+    path: tuple[str, ...]
+    reason: str
+    exclusions: Mapping[type, frozenset[str]]
+
+
+@dataclass(frozen=True)
+class ProjectionPlan:
+    """A derived keep-spec and conservative proof of exclusion, without a validator.
+
+    `spec` is a fresh dict suitable for `Projection`. `complete` describes JSON input-key coverage:
+    excluded keys are provably removed at every occurrence, and no migration can recreate them before
+    field validation. It does not guarantee final attribute values: after validators can assign any
+    attribute, including an excluded one. `fallbacks` explains the boundaries that prevent the input-key
+    proof. The record is frozen; its spec remains an editable dict, but coverage is not recomputed after
+    edits. Coverage does not prove that arbitrary model validators accept the input.
+    """
+
+    spec: dict[str, Any]
+    complete: bool
+    fallbacks: tuple[ProjectionFallback, ...]
+
+
 def _derive_spec(
     model: type[BaseModel],
     excluded: dict[type, frozenset[str]],
     adapters: Mapping[type, ProjectionAdapter],
-) -> tuple[dict[str, Any], bool]:
+) -> ProjectionPlan:
     """The keep-spec for `model` minus `excluded`, and whether it covers every occurrence of every class.
 
     Every shape the derivation cannot describe is kept whole instead: a class that appears inside itself
@@ -587,13 +693,25 @@ def _derive_spec(
     """
     schema: dict[str, Any] = cast("dict[str, Any]", model.__pydantic_core_schema__)
     definitions = _definitions(schema)
-    complete = [True]
+    _validate_excluded(model, excluded, schema, definitions)
+    fallbacks: list[ProjectionFallback] = []
     wrapper_kind: list[str] = []
     foreign: list[tuple[str, type]] = []  # (wrapper kind, adapted class) for wrappers it does not own
     derived: set[type] = set()  # classes this call has already derived, for real or to discard
     own_chains: dict[type, list[int] | None] = {}  # each adapted class's own outer wrapper sequence
 
-    def opaque(node: dict[str, Any], seen: frozenset[type]) -> bool:
+    def record(node: dict[str, Any], path: tuple[str, ...], reason: str) -> None:
+        affected = {
+            n["cls"]: excluded[n["cls"]] for n in _subtree_models(node, definitions) if excluded.get(n["cls"])
+        }
+        if affected:
+            fallbacks.append(
+                ProjectionFallback(path=path, reason=reason, exclusions=MappingProxyType(affected))
+            )
+
+    def opaque(
+        node: dict[str, Any], seen: frozenset[type], path: tuple[str, ...], reason: str | None = None
+    ) -> bool:
         """Keep this subtree whole, and derive the adapted classes in it for their errors alone.
 
         Every fallback goes through here. Below a kept subtree nothing is projected, so an excluded
@@ -612,96 +730,125 @@ def _derive_spec(
         this on a schema the derivation has just walked is cheap rather than free: the classes it
         reached are skipped, and only the ones it stepped over -- below an excluded field -- are run.
         """
-        if _reaches_excluded(node, definitions, excluded):
-            complete[0] = False
+        record(node, path, reason or f"opaque {node.get('type', 'schema')} subtree kept whole")
         for model_node in _subtree_models(node, definitions):
             if model_node["cls"] in adapters and model_node["cls"] not in derived:
-                spec_for(model_node, seen)  # marks it derived on the way in
+                checkpoint = len(fallbacks)
+                spec_for(model_node, seen, path)  # marks it derived on the way in
+                del fallbacks[checkpoint:]  # this derivation checks adapter errors, not projected boundaries
         return True
 
-    def spec_for(node: dict[str, Any], seen: frozenset[type]) -> Any:
+    def spec_for(node: dict[str, Any], seen: frozenset[type], path: tuple[str, ...]) -> Any:
         t = node.get("type")
         if t == "definitions":  # root of every model with recursive references
-            return spec_for(node["schema"], seen)
+            return spec_for(node["schema"], seen, path)
         if t == "definition-ref":
             target = definitions.get(node["schema_ref"])
-            return opaque(node, seen) if target is None else spec_for(target, seen)
+            return opaque(node, seen, path) if target is None else spec_for(target, seen, path)
         if t in _OPAQUE_WRAPPERS:
             behind, owned = _adapted_model_behind(node, definitions, adapters, own_chains)
             if owned and behind is not None:
                 # one of the class's own registered model validators; its adapter says what it reads
-                return spec_for(behind, seen)
+                return spec_for(behind, seen, path)
             if behind is not None:
                 foreign.append((t, behind["cls"]))  # adapted, but this wrapper is somebody else's
             wrapper_kind.append(t)
-            return opaque(node, seen)
+            return opaque(node, seen, path)
         if t in ("nullable", "default", "function-after"):
             # function-after runs on what the inner schema already validated, so that shape is known
             return (
-                spec_for(node["schema"], seen) if isinstance(node.get("schema"), dict) else opaque(node, seen)
+                spec_for(node["schema"], seen, path)
+                if isinstance(node.get("schema"), dict)
+                else opaque(node, seen, path)
             )
         if t in ("list", "set", "frozenset"):
             if not isinstance(node.get("items_schema"), dict):
-                return opaque(node, seen)
-            return {"__all__": spec_for(node["items_schema"], seen)}
+                return opaque(node, seen, path)
+            return {"__all__": spec_for(node["items_schema"], seen, (*path, "__all__"))}
         if (
             t == "tuple"
             and node.get("variadic_item_index") is not None
             and len(node.get("items_schema", [])) == 1
         ):
-            return {"__all__": spec_for(node["items_schema"][0], seen)}  # tuple[X, ...]
+            return {"__all__": spec_for(node["items_schema"][0], seen, (*path, "__all__"))}  # tuple[X, ...]
         if t == "model":
             cls = node["cls"]
             derived.add(cls)  # before anything below can ask for it again
             inner = seen | {cls}  # a fallback on this class must not derive it again
             if cls in seen:
-                return opaque(node, inner)  # a class inside itself; a spec is a finite tree
+                return opaque(node, inner, path, "recursive model subtree kept whole")
             if _extra(cls) == "allow" and not excluded.get(cls):
                 # undeclared keys are data on this class, so keep the whole object
-                return opaque(node, inner)
+                return opaque(node, inner, path, "extra='allow' model subtree kept whole")
             adapter = adapters.get(cls)
             fields, kind = _fields_node(node, definitions)
             if kind is not None and (adapter is None or fields is None):
                 # a before/wrap validator's input is not the shape its fields describe: only an adapter
                 # can say what it reads -- and a plain validator has no fields to retain at all
                 wrapper_kind.append(kind)
-                return opaque(node, inner)
+                return opaque(node, inner, path, f"opaque {kind} validator subtree kept whole")
             if fields is None:
-                return opaque(node, inner)
+                return opaque(node, inner, path)
             out: dict[str, Any] = {}
-            sources: dict[str, list[dict[str, Any]]] = {}  # every field schema a kept key came from
+            sources: dict[str, dict[str, dict[str, Any]]] = {}  # every field schema a kept key came from
             for name, field in fields["fields"].items():
                 if name in excluded.get(cls, ()):
                     continue
                 fschema = field["schema"]
-                sub = spec_for(fschema, inner)
+                sub = spec_for(fschema, inner, (*path, name))
                 for key, direct in _field_keys(name, field.get("validation_alias")):
                     # a multi-segment alias path names an enclosing object, not the field's own value.
                     # `opaque`, even though `spec_for` has just walked this: it skipped the field's
                     # excluded fields, and an adapted class under one of those has had no adapter call
-                    value = sub if direct else opaque(fschema, inner)
-                    sources.setdefault(key, []).append(fschema)
+                    value = (
+                        sub
+                        if direct
+                        else opaque(
+                            fschema, inner, (*path, name), f"alias path through JSON key {key!r} kept whole"
+                        )
+                    )
+                    sources.setdefault(key, {})[name] = fschema
                     if out.get(key, value) != value:
                         # two fields under one JSON key describe it differently: keep it whole. Every
                         # field that has described this key so far is now inside a kept subtree, not
                         # just this one and the previous: two of them can agree while a third differs.
-                        # Emptying the list keeps that linear -- once the key is `True`, the fields
+                        # Clearing the contributors keeps that linear -- once the key is `True`, the fields
                         # already walked stay walked, and a later collision only brings its own
                         value = True
-                        for contributor in sources[key]:
-                            opaque(contributor, inner)
-                        sources[key] = []
+                        for field_name, contributor in sources[key].items():
+                            opaque(
+                                contributor,
+                                inner,
+                                (*path, field_name),
+                                f"colliding aliases for JSON key {key!r} kept whole",
+                            )
+                        sources[key] = {}
                     out[key] = value
+            for name in sorted(excluded.get(cls, ())):
+                field = fields["fields"].get(name)
+                if field is None:
+                    continue
+                keys = {key for key, _ in _field_keys(name, field.get("validation_alias"))}
+                if field["schema"].get("type") == "default":
+                    keys.add(_EXCLUDED_ALIAS_PREFIX + name)
+                collisions = sorted(keys.intersection(out))
+                if collisions:
+                    fallbacks.append(
+                        ProjectionFallback(
+                            path=(*path, name),
+                            reason=f"colliding aliases retain excluded field keys: {collisions!r}",
+                            exclusions=MappingProxyType({cls: frozenset({name})}),
+                        )
+                    )
             if adapter is None:
                 return out
             retained = frozenset(n for n in fields["fields"] if n not in excluded.get(cls, ()))
             spec = _adapter_spec(cls, adapter(AdapterContext(cls, retained, out)))
-            if _reaches_excluded(node, definitions, excluded):
-                complete[0] = False  # a migration may recreate an excluded key from the inputs it kept
+            record(node, path, "migration may recreate excluded fields from retained inputs")
             return spec
-        return opaque(node, seen)  # dict, unions, fixed tuples, dataclasses, TypedDicts, Any, scalars
+        return opaque(node, seen, path)  # dict, unions, fixed tuples, dataclasses, TypedDicts, Any, scalars
 
-    root = spec_for(schema, frozenset())
+    root = spec_for(schema, frozenset(), ())
     in_schema = {n["cls"] for n in _subtree_models(schema, definitions)}
     absent = [cls for cls in adapters if cls not in in_schema]
     if absent:
@@ -737,7 +884,24 @@ def _derive_spec(
                 f"fields, so the shape of its input is unknown; {hint}, or use projected_validator alone"
             )
         raise TypeError(f"{model.__qualname__}: could not derive an object spec from its core schema")
-    return root, complete[0]
+    return ProjectionPlan(spec=root, complete=not fallbacks, fallbacks=tuple(fallbacks))
+
+
+def projection_plan(
+    model: type[BaseModel],
+    exclude: Exclude,
+    *,
+    projection_adapters: Mapping[type, ProjectionAdapter] | None = None,
+) -> ProjectionPlan:
+    """Plan field exclusion and report any boundaries where removal cannot be proved.
+
+    No validator is constructed. Unknown model classes or field names in `exclude` raise `ValueError`,
+    including classes beneath excluded parent fields; malformed exclusion collections raise `TypeError`.
+    Adapters are applied as in `projection_spec`, including their field and dependency checks. A plan
+    can describe incomplete coverage even when `Projected` would refuse the model's configuration.
+    Root shapes that cannot be expressed as an object keep-spec still raise `TypeError`.
+    """
+    return _derive_spec(model, normalize_exclude(model, exclude), dict(projection_adapters or {}))
 
 
 def projection_spec(
@@ -750,9 +914,10 @@ def projection_spec(
 
     `projection_adapters` maps classes to adapters that say what their before/wrap validators read
     (see `ProjectionAdapter` and `migration_adapter`). Lookup is by exact class, and an adapter for a
-    class absent from the schema is a `ValueError`.
+    class absent from the schema is a `ValueError`. Unknown excluded classes or field names are also
+    a `ValueError`. Use `projection_plan` to inspect conservative exclusion coverage and its fallbacks.
     """
-    return _derive_spec(model, normalize_exclude(model, exclude), dict(projection_adapters or {}))[0]
+    return projection_plan(model, exclude, projection_adapters=projection_adapters).spec
 
 
 class Projected:
@@ -760,11 +925,14 @@ class Projected:
 
     Combines a byte projection (unwanted members are skipped by the Rust cursor) with a validator built
     from the model's core schema minus the excluded fields. Results are instances of the original classes.
+    Exclusion controls input keys, not final attribute values: an after validator may assign an excluded
+    attribute from retained data.
 
     The projection keeps whole every subtree it cannot describe (see `_derive_spec`). An excluded class
     inside one still sees its keys, so it must use `extra='ignore'`, and an excluded field with a default
     must not be populated by name; `projected_validator` raises `ValueError` otherwise. `validate_json`
     refuses `by_name=True` and `by_alias=False` for the same reason while `complete` is False.
+    A retained field using an excluded defaulted field's synthetic alias is refused too.
 
     Classes behind a ``model_validator(mode='before')`` or ``'wrap'`` are projected only when
     ``projection_adapters`` holds an adapter for them (see `migration_adapter`); the adapter says which
@@ -788,22 +956,24 @@ class Projected:
         self.model = model
         self.exclude = normalize_exclude(model, exclude)
         self.projection_adapters: dict[type, ProjectionAdapter] = dict(projection_adapters or {})
-        spec, self._complete = _derive_spec(model, self.exclude, self.projection_adapters)
+        plan = _derive_spec(model, self.exclude, self.projection_adapters)
+        self._complete = plan.complete
         # the guards in projected_validator are only unnecessary when the projection removes every occurrence
         self.validator = projected_validator(model, self.exclude, assume_projected=self._complete)
-        self.spec = Projection(spec)
+        self.spec = Projection(plan.spec)
 
     @property
     def complete(self) -> bool:
-        """Whether the projection provably removes every excluded key, everywhere.
+        """Whether every excluded JSON input key is provably removed before field validation.
 
         A conservative proof, not a measurement: `True` only when every occurrence of every excluded
         class is described by the derived spec, so no excluded key can survive projection and no
-        migration validator can recreate one from what did. `False` whenever an excluded class sits
-        inside a kept-whole subtree, or below a class whose adapter kept inputs a migration could
-        rebuild it from. Read-only: it decides whether the `projected_validator` config guards are
-        dropped and whether `validate_json` accepts `by_name`, and lowering the bar after construction
-        would not make either safe.
+        pre-validation migration can recreate one from retained inputs. This says nothing about final
+        attribute values: after validators may assign excluded attributes. `False` whenever an excluded
+        class sits inside a kept-whole subtree, or below a class whose adapter kept inputs a migration could
+        rebuild it from, or an alias collision retains an excluded key. Read-only: it decides whether
+        the `projected_validator` config guards are dropped and whether `validate_json` accepts `by_name`,
+        and lowering the bar after construction would not make either safe.
         """
         return self._complete
 
@@ -821,7 +991,8 @@ class Projected:
             # keep whole; validating by name reads it there and the default is never applied
             raise ValueError(
                 f"{self.model.__qualname__}: the projection cannot prove that every excluded key is "
-                "gone -- it keeps some subtrees whole, or a migration validator could recreate a key "
+                "gone -- it keeps some subtrees whole or retains colliding alias keys, or a migration "
+                "validator could recreate a key "
                 "from the inputs an adapter kept -- so validating by name would read an excluded key "
                 "that is left. Drop by_name/by_alias, or exclude nothing inside those subtrees."
             )

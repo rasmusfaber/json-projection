@@ -4,7 +4,9 @@ use crate::spec::Spec;
 
 pub(super) enum Node {
     Keep,
+    Discard,
     Object(HashMap<String, usize>),
+    ExcludeObject(HashMap<String, usize>),
     Array(usize),
 }
 
@@ -25,12 +27,18 @@ impl StreamPlan {
         self.nodes.push(Node::Keep);
         self.nodes[index] = match spec {
             Spec::Keep => Node::Keep,
-            Spec::Object(fields) => Node::Object(
-                fields
+            Spec::Discard => Node::Discard,
+            Spec::Object(fields) | Spec::ExcludeObject(fields) => {
+                let children = fields
                     .iter()
                     .map(|(key, value)| (key.clone(), self.insert(value)))
-                    .collect(),
-            ),
+                    .collect();
+                if matches!(spec, Spec::ExcludeObject(_)) {
+                    Node::ExcludeObject(children)
+                } else {
+                    Node::Object(children)
+                }
+            }
             Spec::Array(child) => Node::Array(self.insert(child)),
         };
         index

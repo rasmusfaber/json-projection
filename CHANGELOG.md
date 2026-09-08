@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Added `Projection.excluding()` to remove named JSON members while retaining all unspecified members, including during streaming.
+- Avoided formatting complete Pydantic validators during construction by using a cached schema-edit compatibility probe.
+- Standalone projection planning now rejects unknown exclusion fields and classes; `projection_plan()` reports incomplete coverage and its causes.
+- Fixed alias-collision coverage reporting and rejected retained aliases that would populate an excluded field through its hidden alias.
+
 ## 0.2.0 (unreleased)
 
 - Added streaming JSON projection from binary readers or byte chunks without buffering the complete input.

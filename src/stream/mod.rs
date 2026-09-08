@@ -289,7 +289,7 @@ impl Engine {
         if let Action::Project(node) = action {
             if !matches!(
                 (self.plan.node(node), byte),
-                (Node::Object(_), b'{') | (Node::Array(_), b'[')
+                (Node::Object(_) | Node::ExcludeObject(_), b'{') | (Node::Array(_), b'[')
             ) {
                 action = Action::Copy;
             }
@@ -362,20 +362,26 @@ impl Engine {
                         });
                     }
                 };
-                let Node::Object(fields) = self.plan.node(node) else {
-                    unreachable!()
+                let (fields, fallback) = match self.plan.node(node) {
+                    Node::Object(fields) => (fields, Action::Discard),
+                    Node::ExcludeObject(fields) => (fields, Action::Copy),
+                    _ => unreachable!(),
                 };
-                match fields.get(key) {
-                    Some(child) => {
-                        if frame.emitted {
-                            self.output.push(b',');
-                        }
-                        frame.emitted = true;
-                        self.output.extend_from_slice(&self.key);
-                        Action::Project(*child)
+                let next = match fields.get(key) {
+                    Some(child) if matches!(self.plan.node(*child), Node::Discard) => {
+                        Action::Discard
                     }
-                    None => Action::Discard,
+                    Some(child) => Action::Project(*child),
+                    None => fallback,
+                };
+                if next != Action::Discard {
+                    if frame.emitted {
+                        self.output.push(b',');
+                    }
+                    frame.emitted = true;
+                    self.output.extend_from_slice(&self.key);
                 }
+                next
             }
             action => action,
         };

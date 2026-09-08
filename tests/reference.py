@@ -47,6 +47,36 @@ def reference_project(obj: Any, spec: Any) -> Any:
     return Obj((k, v) for k, v in obj if k in keep)
 
 
+def reference_exclude(obj: Any, spec: Any) -> Any:
+    """Remove named object members, preserving unnamed members and mismatched shapes."""
+    if isinstance(spec, dict) and set(spec) == {"__all__"}:
+        if isinstance(obj, Obj) or not isinstance(obj, list):
+            return obj
+        return [reference_exclude(value, spec["__all__"]) for value in obj]
+    if not isinstance(obj, Obj):
+        return obj
+    rules = spec if isinstance(spec, dict) else dict.fromkeys(spec, True)
+    return Obj(
+        (key, reference_exclude(value, rules[key]) if key in rules else value)
+        for key, value in obj
+        if rules.get(key) is not True
+    )
+
+
+def exclusion_corpus(seed: int, n: int) -> list[tuple[bytes, Any]]:
+    """Generated member exclusions; an array wildcard always contains a nested rule."""
+
+    def member_rules(spec: Any) -> Any:
+        if not isinstance(spec, dict):
+            return spec
+        return {
+            key: {} if key == "__all__" and value is True else member_rules(value)
+            for key, value in spec.items()
+        }
+
+    return [(raw, member_rules(spec)) for raw, spec in corpus(seed, n)]
+
+
 _WORDS = ["a", "b", "id", "name", "items", "meta", "é", "日本", "x,y", 'q"q', "", "with space", "\\u0041"]
 _DUP = "\x00dup"  # placeholder key, rewritten to a sibling's key to produce a duplicate member
 

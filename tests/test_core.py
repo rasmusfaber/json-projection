@@ -5,12 +5,86 @@ from typing import Any
 import pytest
 
 from json_projection import Projection, project
-from reference import Obj, canon, corpus, parse, reference_project
+from reference import Obj, canon, corpus, exclusion_corpus, parse, reference_exclude, reference_project
 
 
 def test_project_root_keys_from_set():
     raw = b'{"a": 1.5, "skip": [1, 2, {"x": "y"}], "b": "s"}'
     assert project(raw, {"a"}) == b'{"a": 1.5}'
+
+
+def test_excluding_keeps_unspecified_members_and_is_reusable():
+    projection = Projection.excluding({"drop"})
+    raw = b'{"id":1,"drop":[2,3],"new":4}'
+    assert projection(raw) == b'{"id":1,"new":4}'
+    assert projection.apply(raw) == b'{"id":1,"new":4}'
+    assert projection(b'{"future":{"drop":1}}') == b'{"future":{"drop":1}}'
+    assert "Projection.excluding(" in repr(projection)
+
+
+def test_excluding_nested_members_and_array_elements_preserves_unknown_data():
+    projection = Projection.excluding(
+        {"meta": {"secret"}, "samples": {"__all__": {"events": True, "store": {"secret": True}}}}
+    )
+    raw = (
+        b'{"meta":{"secret":1,"new":2},"samples":['
+        b'{"events":[1],"store":{"secret":2,"keep":3},"extra":4},'
+        b'{"store":5},null,[{"events":6}]],"untouched":{"secret":7}}'
+    )
+    assert projection(raw, strict=True) == (
+        b'{"meta":{"new":2},"samples":['
+        b'{"store":{"keep":3},"extra":4},{"store":5},null,[{"events":6}]],'
+        b'"untouched":{"secret":7}}'
+    )
+
+
+def test_excluding_matches_decoded_keys_and_preserves_retained_spelling():
+    raw = b'{"\\u0064rop":0,"id":1.00,"drop":2,"id":NaN,"new":18446744073709551617}'
+    assert Projection.excluding({"drop"})(raw, strict=True) == (
+        b'{"id":1.00,"id":NaN,"new":18446744073709551617}'
+    )
+
+
+@pytest.mark.parametrize("spec", [{}, set(), [], {"absent": True}])
+def test_empty_or_absent_exclusions_keep_all_members(spec):
+    raw = b'{"id":1,"obj":{"x":2},"array":[3],"id":4}'
+    assert Projection.excluding(spec)(raw, strict=True) == raw
+
+
+def test_excluding_accepts_mapping_protocols_and_iterators():
+    from types import MappingProxyType
+
+    projection = Projection.excluding(MappingProxyType({"obj": iter(["drop"])}))
+    assert projection(b'{"obj":{"drop":1,"keep":2},"other":3}') == b'{"obj":{"keep":2},"other":3}'
+    assert Projection.excluding({"__all__"})(b'{"__all__":1,"keep":2}') == b'{"keep":2}'
+
+
+@pytest.mark.parametrize(
+    "spec", [True, False, "drop", {"drop": False}, {"drop": 1}, {1: True}, {"__all__": {}}]
+)
+def test_excluding_rejects_invalid_specs(spec):
+    with pytest.raises(TypeError):
+        Projection.excluding(spec)
+
+
+def test_excluding_does_not_remove_array_elements():
+    with pytest.raises(TypeError, match="array"):
+        Projection.excluding({"items": {"__all__": True}})
+
+
+@pytest.mark.parametrize("raw", [b'{"drop":[1,]}', b'{"keep":01}', b'{"drop":"\\q"}', b"{}x", b"[]"])
+def test_excluding_retains_whole_buffer_error_contract(raw):
+    projection = Projection.excluding({"drop"})
+    assert projection(raw) is raw
+    with pytest.raises(ValueError):
+        projection(raw, strict=True)
+
+
+@pytest.mark.parametrize("seed", [3, 9])
+def test_excluding_matches_independent_reference(seed):
+    for raw, spec in exclusion_corpus(seed, 1000):
+        actual = Projection.excluding(spec)(raw, strict=True)
+        assert canon(parse(actual)) == canon(reference_exclude(parse(raw), spec)), (raw, spec)
 
 
 def test_projection_is_reusable_and_callable():
@@ -113,22 +187,24 @@ def test_corpus_covers_duplicate_keys_and_arrays_of_arrays_of_objects():
     assert sum(_has_nested_all(spec) for _, spec in docs) > 50
 
 
-def test_self_referential_spec_is_rejected():
+@pytest.mark.parametrize("constructor", [Projection, Projection.excluding])
+def test_self_referential_spec_is_rejected(constructor):
     d = {}
     d["self"] = d
     with pytest.raises(TypeError, match="nesting"):
-        project(b"{}", d)
+        constructor(d)
 
 
-def test_spec_nesting_is_capped():
+@pytest.mark.parametrize("constructor", [Projection, Projection.excluding])
+def test_spec_nesting_is_capped(constructor):
     deep: Any = True
     for _ in range(256):  # MAX_DEPTH in src/spec.rs
         deep = {"k": deep}
-    assert project(b'{"k": 1}', deep) == b'{"k": 1}'
+    assert constructor(deep)(b'{"k": 1}') == b'{"k": 1}'
     for _ in range(2000):
         deep = {"k": deep}
     with pytest.raises(TypeError, match="nesting"):
-        project(b"{}", deep)
+        constructor(deep)
 
 
 def test_a_mapping_that_mutates_the_spec_while_it_compiles_does_not_panic():

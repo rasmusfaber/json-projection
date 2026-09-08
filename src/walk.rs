@@ -57,17 +57,19 @@ fn project_value(
     out: &mut Vec<u8>,
 ) -> Result<(), WalkError> {
     match (spec, peek) {
-        (Spec::Object(map), Peek::Object) => project_object(j, data, map, out),
+        (Spec::Object(map), Peek::Object) => project_object(j, data, map, &Spec::Discard, out),
+        (Spec::ExcludeObject(map), Peek::Object) => project_object(j, data, map, &Spec::Keep, out),
         (Spec::Array(inner), Peek::Array) => project_array(j, data, inner, out),
         _ => copy_value(j, data, peek, out),
     }
 }
 
-/// Cursor at `{`. Keep members whose key is in `map`, each with its own spec; skip every other member.
+/// Cursor at `{`. Apply each member's rule, or `fallback` for unlisted keys.
 fn project_object(
     j: &mut Jiter,
     data: &[u8],
     map: &std::collections::HashMap<String, Spec>,
+    fallback: &Spec,
     out: &mut Vec<u8>,
 ) -> Result<(), WalkError> {
     out.push(b'{');
@@ -76,12 +78,12 @@ fn project_object(
     let mut first = true;
     while let Some(k) = key {
         // decide before the next cursor call: `k` borrows jiter's tape
-        let sub = map.get(k);
+        let sub = map.get(k).unwrap_or(fallback);
         let ks = key_start(data, sep);
         let peek = j.peek()?;
         match sub {
-            None => j.known_skip(peek)?,
-            Some(sub) => {
+            Spec::Discard => j.known_skip(peek)?,
+            sub => {
                 if !first {
                     out.push(b',');
                 }

@@ -24,7 +24,7 @@ from json_projection import Projection
 
 payload_bytes = int(sys.argv[1]) * 1024 * 1024
 malformed = sys.argv[2] == "malformed"
-projection = Projection({"id"})
+projection = Projection.excluding({"drop"}) if sys.argv[3] == "excluding" else Projection({"id"})
 session = projection.stream()
 chunk = b"x" * (64 * 1024)
 prefix = b'{"id":1,"drop":"'
@@ -54,9 +54,16 @@ class MemoryResult:
     error: str | None
 
 
-def _measure(size_mib: int, *, malformed: bool = False) -> MemoryResult:
+def _measure(size_mib: int, *, malformed: bool = False, excluding: bool = False) -> MemoryResult:
     proc = subprocess.run(
-        [sys.executable, "-c", _PROBE, str(size_mib), "malformed" if malformed else "valid"],
+        [
+            sys.executable,
+            "-c",
+            _PROBE,
+            str(size_mib),
+            "malformed" if malformed else "valid",
+            "excluding" if excluding else "including",
+        ],
         capture_output=True,
         text=True,
         cwd=ROOT,
@@ -66,9 +73,10 @@ def _measure(size_mib: int, *, malformed: bool = False) -> MemoryResult:
     return MemoryResult(**json.loads(proc.stdout))
 
 
-def test_discarded_string_memory_is_bounded() -> None:
-    smaller = _measure(8)
-    larger = _measure(128)
+@pytest.mark.parametrize("excluding", [False, True])
+def test_discarded_string_memory_is_bounded(excluding: bool) -> None:
+    smaller = _measure(8, excluding=excluding)
+    larger = _measure(128, excluding=excluding)
 
     for result in (smaller, larger):
         assert result.error is None
@@ -77,8 +85,9 @@ def test_discarded_string_memory_is_bounded() -> None:
     assert larger.delta_kib <= smaller.delta_kib + 16 * 1024, (smaller, larger)
 
 
-def test_late_malformed_suffix_after_large_discarded_string() -> None:
-    result = _measure(128, malformed=True)
+@pytest.mark.parametrize("excluding", [False, True])
+def test_late_malformed_suffix_after_large_discarded_string(excluding: bool) -> None:
+    result = _measure(128, malformed=True, excluding=excluding)
 
     assert result.output is None
     offset = len(b'{"id":1,"drop":"') + 128 * 1024 * 1024 + len(b'"}')

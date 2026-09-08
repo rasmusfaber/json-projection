@@ -36,6 +36,36 @@ p(raw)  # keep items[*].id and name
 A spec is a set of root keys, or a mapping where a key maps to `True` (keep the whole value), a nested mapping
 (descend into an object) or `{"__all__": spec}` (apply to each array element). Everything not named is dropped.
 
+### Excluding JSON members
+
+Use `Projection.excluding()` when you know what to discard and want to preserve every other member:
+
+```python
+projection = jp.Projection.excluding({"messages", "events", "store", "attachments"})
+projection(b'{"id":1,"events":[2,3],"future_field":4}')
+# b'{"id":1,"future_field":4}'
+
+projection = jp.Projection.excluding(
+    {
+        "samples": {"__all__": {"events": True, "store": {"large_blob": True}}},
+    }
+)
+with open("log.json", "rb") as source:
+    projected = projection.apply_stream(source)
+```
+
+In an exclusion spec, `True` removes the entire named member, a nested mapping applies exclusions inside
+that object, and `{"__all__": spec}` applies a nested rule to each array element. An iterable of names
+removes those members. Unnamed members are kept whole, including unknown or legacy keys; an empty
+exclusion removes nothing. When a value does not match the nested rule's object/array shape, it is kept
+whole. Array elements are never removed: `{"__all__": True}` is rejected in an exclusion spec; exclude the
+containing member to remove the array. The existing `__all__` reservation and spec-depth limit also apply.
+
+The returned `Projection` supports `apply()`, calling, `stream()`, and `apply_stream()` with the same
+syntax checking and error behavior as an inclusion projection. These are **raw JSON key exclusions**:
+excluding `events` does not also exclude a legacy `transcript.events`. Use explicit nested rules or the
+Pydantic integration's migration adapters when logical fields have legacy input locations.
+
 ### Streaming input
 
 Use `Projection.apply_stream()` to project one JSON object from a binary file-like source:
@@ -115,6 +145,42 @@ Excluded fields that have a default keep their default. Excluded required fields
 and from `model_fields_set`. `exclude` is keyed by class so nested third-party models can be targeted; a plain
 set means the root model.
 
+### Planning without replacing validation
+
+`projection_spec()` derives a byte-selection dictionary without constructing an edited validator.
+`projection_plan()` also reports the limits of that selection:
+
+```python
+from pydantic_core import from_json
+from json_projection import Projection
+from json_projection.pydantic import projection_plan
+
+plan = projection_plan(Log, exclude={Sample: {"events"}})
+projection = Projection(plan.spec)  # cache this for repeated reads with the same exclusions
+with open("log.json", "rb") as source:
+    data = from_json(projection.apply_stream(source))
+log = Log.model_validate(data)  # the model's original Python-mode validation
+
+for fallback in plan.fallbacks:
+    print(fallback.path, fallback.reason, fallback.exclusions)
+```
+
+Both helpers accept `projection_adapters` and check exclusion classes and field names against the original
+schema, just as `projected_validator()` and `Projected` do. Unknown fields or absent classes raise
+`ValueError`; malformed field-name collections raise `TypeError`.
+
+`ProjectionPlan.spec` is the dictionary to compile, and `complete` is a conservative proof that excluded
+input keys are removed everywhere before field validation, accounting for adapted migrations. `fallbacks`
+identifies affected exclusions and their reasons, such as an opaque union, recursive model, alias collision, or
+migration that may reconstruct fields. Paths use model field names, `__all__` for array items, and `()` for
+the root. Diagnostics describe schema paths and possibilities, not which branches a particular document
+contains. A migration fallback can indicate reconstruction even when its bytes are projected.
+The spec is editable; the coverage report describes the original plan and is not recomputed after edits.
+
+Ordinary validation still requires all required fields and runs migrations normally; a migration can
+reconstruct an excluded field from retained inputs. `Projected` additionally edits the validator to suppress
+excluded fields where supported. Choose the byte-only plan when you want the original validation behavior.
+
 ### Migration validators
 
 A model whose fields sit behind a `model_validator(mode='before')` or `mode='wrap'` reads keys the schema
@@ -188,9 +254,11 @@ an excluded key from the inputs it was given. `examples/inspect_adapters.py` hol
   can intercept this, and withholding an adapter does not help -- a nested migration runs inside the
   kept-whole subtree anyway -- so exclude nothing on the class such a migration builds.
 - The pydantic integration relies on the core-schema layout and on `SchemaValidator(..., _use_prebuilt=False)`,
-  which pydantic does not promise to keep. CI tests the latest release and pre-release; a `RuntimeError` is
-  raised if pydantic-core ignores the schema edit.
+  which pydantic does not promise to keep. CI tests the latest release and pre-release; a small cached
+  behavioral probe checks that nested schema edits take effect and raises `RuntimeError` if they do not.
 - **Refused configurations.** `projected_validator` on its own refuses, with `ValueError`, models whose config would still consume an excluded key: `extra='forbid'` or `extra='allow'`, and `populate_by_name`/`validate_by_name` when an excluded field has a default. `Projected` lifts that restriction only when its derived projection provably reaches every occurrence of every excluded class; where it cannot (see "Kept-whole subtrees"), the guards stay on.
+  Both validator entry points also refuse a retained field whose input alias collides with the hidden alias
+  used for an excluded defaulted field; the byte-only planner reports that collision without constructing a validator.
 - **Before/wrap/plain validators are not projected through.** Their input is not the shape the schema they
   wrap describes, so a model or field behind one is kept whole and nothing inside it is projected. A root
   model whose own fields sit behind a `model_validator(mode='before')`, `'wrap'` or `'plain'` cannot be
@@ -204,8 +272,9 @@ an excluded key from the inputs it was given. `examples/inspect_adapters.py` hol
   migration a second time, over a shape the adapter never described. A field validator on the enclosing
   model is the same story. At the root such a wrapper raises `TypeError` saying so, rather than asking
   for the adapter you already registered.
-- **After validators and excluded required fields.** A `model_validator(mode='after')` that touches an excluded
-  required field raises `AttributeError` from `validate_json`, not a `ValidationError`.
+- **After validators and excluded fields.** After validators still run and may repopulate model attributes;
+  plan completeness describes input-key exclusion, not final attribute values. A `model_validator(mode='after')`
+  that touches an excluded required field raises `AttributeError` from `validate_json`, not a `ValidationError`.
 - **Extras.** A model with `extra='allow'` that has no excluded field of its own is kept whole (nothing below it
   is projected), and an adapter registered for it is not consulted, so its `requires` are not checked. A
   model with `extra='allow'` that does have excluded fields loses all its extras: the projection keeps only

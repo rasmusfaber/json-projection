@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from json_projection import Projection, ProjectionStream
-from reference import canon, corpus, parse, reference_project
+from reference import canon, corpus, exclusion_corpus, parse, reference_exclude, reference_project
 
 
 def run_chunks(projection: Projection, chunks: Iterable[bytes]) -> bytes:
@@ -27,6 +27,46 @@ def test_stream_public_api():
     session.feed(b'{"id":1,"discard":[')
     session.feed(b"1,2,3]}")
     assert session.finish() == b'{"id":1}'
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"{}",
+        b'{ "drop":1,"new":2,"drop":3,"id":1.00,"new":NaN}',
+        b'{"samples":[{"events":[1],"id":2},null,{"events":3,"future":4}]}',
+        b'{"samples":{"events":1},"new":[ {"drop":2} ]}',
+        '{"\\u0064rop":1,"日本":2,"é":"keep"}'.encode(),
+        b'{"drop":"\\uD83D\\uDE00","new":Infinity}',
+    ],
+)
+def test_excluding_stream_matches_whole_buffer_at_every_split(raw: bytes):
+    projection = Projection.excluding({"drop": True, "samples": {"__all__": {"events": True}}})
+    expected = projection(raw, strict=True)
+    for split in range(len(raw) + 1):
+        assert run_chunks(projection, (raw[:split], b"", raw[split:])) == expected
+    assert projection.apply_stream(io.BytesIO(raw), chunk_size=1) == expected
+
+
+def test_excluding_stream_matches_generated_reference():
+    for raw, spec in exclusion_corpus(29, 300):
+        projection = Projection.excluding(spec)
+        expected = projection(raw, strict=True)
+        for size in (1, 7, 64):
+            actual = run_chunks(projection, (raw[i : i + size] for i in range(0, len(raw), size)))
+            assert actual == expected
+            assert canon(parse(actual)) == canon(reference_exclude(parse(raw), spec))
+
+
+@pytest.mark.parametrize("raw", [b'{"drop":[1,]}', b'{"new":"\\q"}', b'{"drop":"\\uD800"}', b"{}x"])
+def test_excluding_stream_error_offsets_do_not_depend_on_chunking(raw: bytes):
+    projection = Projection.excluding({"drop"})
+    with pytest.raises(ValueError) as expected:
+        run_chunks(projection, (raw,))
+    for split in range(len(raw) + 1):
+        with pytest.raises(ValueError) as actual:
+            run_chunks(projection, (raw[:split], raw[split:]))
+        assert str(actual.value) == str(expected.value)
 
 
 def test_apply_stream_reads_from_current_position_and_leaves_source_open() -> None:

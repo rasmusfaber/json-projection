@@ -3,7 +3,6 @@ import importlib
 import math
 import sys
 from typing import Any, Generic, Literal, TypeVar, Union
-from unittest import mock
 
 import pydantic
 import pytest
@@ -18,13 +17,16 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic_core import SchemaValidator
 from typing_extensions import TypedDict
 
+import json_projection.pydantic as jpp
 from json_projection import project
 from json_projection.pydantic import (
     _DATA_KEYS,
     Projected,
     projected_validator,
+    projection_plan,
     projection_spec,
 )
 
@@ -88,6 +90,22 @@ def test_plain_set_means_the_root_model():
 def test_unknown_field_is_value_error():
     with pytest.raises(ValueError, match="nope"):
         projected_validator(Log, {Log: {"nope"}})
+
+
+@pytest.mark.parametrize("build", [projection_plan, projection_spec, projected_validator, Projected])
+@pytest.mark.parametrize("exclude", [{"nope"}, {Event: {"nope"}}, {BaseModel: {"x"}}, {BaseModel: set()}])
+def test_planning_and_validation_reject_unknown_exclusions(build, exclude):
+    with pytest.raises(ValueError, match="not found.*Log"):
+        build(Log, exclude)
+
+
+@pytest.mark.parametrize("build", [projection_plan, projection_spec, projected_validator, Projected])
+@pytest.mark.parametrize(
+    "exclude", ["debug", {Log: "debug"}, [1], {Log: [1]}, {"Log": {"debug"}}, {Log: None}, None]
+)
+def test_planning_and_validation_reject_malformed_exclusions(build, exclude):
+    with pytest.raises(TypeError, match="exclude|field names|model class"):
+        build(Log, exclude)
 
 
 def test_forbid_models_are_refused():
@@ -311,13 +329,68 @@ def test_import_guard_rejects_old_pydantic(monkeypatch):
     sys.modules["json_projection.pydantic"] = jpp  # restore for the remaining tests
 
 
-def test_prebuilt_substitution_is_detected():
-    with mock.patch("json_projection.pydantic.SchemaValidator") as fake:
-        fake.return_value = mock.Mock(
-            __repr__=lambda self: "SchemaValidator(validator=PrebuiltValidator(...))"
-        )
-        with pytest.raises(RuntimeError, match="prebuilt"):
-            projected_validator(Log, {Sample: {"events"}})
+def test_projected_construction_never_formats_a_validator(monkeypatch):
+    native = SchemaValidator
+
+    class NoRepr:
+        def __init__(self, *args, **kwargs):
+            self.inner = native(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def __repr__(self):
+            raise AssertionError("formatting a user validator can allocate megabytes")
+
+    monkeypatch.setattr(jpp, "SchemaValidator", NoRepr)
+    thin = Projected(Log, {Log: {"debug"}, Sample: {"events"}})
+    out = thin.validate_json(RAW)
+    assert out.debug == {} and "events" not in out.samples[0].__dict__
+
+
+def test_prebuilt_substitution_is_detected_behaviorally(monkeypatch):
+    native = SchemaValidator
+
+    def ignores_flag(schema, config=None, **kwargs):
+        return native(schema, config, _use_prebuilt=True)
+
+    monkeypatch.setattr(jpp, "SchemaValidator", ignores_flag)
+    with pytest.raises(RuntimeError, match="prebuilt"):
+        projected_validator(Log, {Sample: {"events"}})
+
+
+@pytest.mark.parametrize("lost_edit", ["required", "alias"])
+def test_compatibility_probe_checks_both_nested_schema_edits(monkeypatch, lost_edit):
+    def ignores_one_edit(schema, config=None, **kwargs):
+        schema = jpp._copy(schema)
+
+        def undo(node):
+            if node.get("type") == "model-fields" and "defaulted" in node["fields"]:
+                if lost_edit == "required":
+                    node["fields"]["required"] = {"type": "model-field", "schema": {"type": "int"}}
+                else:
+                    node["fields"]["defaulted"]["validation_alias"] = "legacy"
+
+        jpp._walk(schema, undo)
+        return SchemaValidator(schema, config, **kwargs)
+
+    monkeypatch.setattr(jpp, "SchemaValidator", ignores_one_edit)
+    with pytest.raises(RuntimeError, match="prebuilt"):
+        projected_validator(Log, {Sample: {"events"}})
+
+
+def test_compatibility_probe_is_cached_between_constructions(monkeypatch):
+    schemas = []
+
+    def counting(schema, config=None, **kwargs):
+        schemas.append(schema)
+        return SchemaValidator(schema, config, **kwargs)
+
+    monkeypatch.setattr(jpp, "SchemaValidator", counting)
+    projected_validator(Log, {Sample: {"events"}})
+    assert len(schemas) == 2  # the small compatibility probe and the requested validator
+    projected_validator(Log, {Log: {"debug"}})
+    assert len(schemas) == 3
 
 
 def test_projection_spec_multi_segment_alias_path_keeps_the_outer_object_whole():
@@ -553,6 +626,166 @@ SHAPES = {
 }
 
 
+def test_projection_plan_does_not_construct_a_validator(monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("planning must not construct a validator")
+
+    monkeypatch.setattr(jpp, "SchemaValidator", forbidden)
+    plan = jpp.projection_plan(Log, {Log: {"debug"}, Sample: {"events"}})
+    assert plan.spec == projection_spec(Log, {Log: {"debug"}, Sample: {"events"}})
+    assert plan.complete is True and plan.fallbacks == ()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        plan.complete = False  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("exclude", [set(), {}, {Log: set()}])
+def test_projection_plan_with_empty_exclusions(exclude):
+    plan = jpp.projection_plan(Log, exclude)
+    assert plan.complete is True and plan.fallbacks == ()
+    assert "debug" in plan.spec
+
+
+@pytest.mark.parametrize("shape", sorted(SHAPES))
+def test_projection_plan_identifies_exclusions_below_opaque_shapes(shape):
+    Child = _child()
+    Outer, _, _ = SHAPES[shape](Child)
+    plan = jpp.projection_plan(Outer, {Child: {"secret"}})
+    assert plan.complete is False
+    assert len(plan.fallbacks) == 1
+    fallback = plan.fallbacks[0]
+    assert fallback.exclusions == {Child: frozenset({"secret"})}
+    expected = {
+        "dict": (("children",), "dict"),
+        "union": (("u",), "union"),
+        "fixed_tuple": (("t",), "tuple"),
+        "dataclass": (("d",), "dataclass"),
+        "typeddict": (("t",), "typed-dict"),
+        "alias_path": (("c",), "alias path"),
+        "key_collision": (("c",), "colliding"),
+        "field_validator_before": (("c",), "function-before"),
+        "field_validator_wrap": (("c",), "function-wrap"),
+        "extra_allow_parent": (("inner",), "extra='allow'"),
+    }
+    path, reason = expected[shape]
+    assert fallback.path == path and reason in fallback.reason
+    with pytest.raises(TypeError):
+        fallback.exclusions[Child] = frozenset()  # type: ignore[index]
+
+
+def test_projection_plan_reports_recursive_boundary_and_array_path():
+    class Node(BaseModel):
+        value: int
+        secret: int = 0
+        children: list["Node"] = []
+
+    Node.model_rebuild()
+    plan = jpp.projection_plan(Node, {"secret"})
+    assert plan.complete is False
+    assert plan.spec == {"value": True, "children": {"__all__": True}}
+    assert len(plan.fallbacks) == 1
+    fallback = plan.fallbacks[0]
+    assert fallback.path == ("children", "__all__")
+    assert fallback.exclusions == {Node: frozenset({"secret"})}
+    assert "recursive" in fallback.reason
+
+
+def test_projection_plan_ignores_excluded_parent_subtrees():
+    plan = jpp.projection_plan(Log, {Log: {"samples"}, Sample: {"events"}, Event: {"payload"}})
+    assert "samples" not in plan.spec
+    assert plan.complete is True and plan.fallbacks == ()
+
+
+def test_retained_alias_for_an_excluded_name_keeps_the_guards():
+    class Collision(BaseModel):
+        keep: int = Field(validation_alias="secret")
+        secret: int = 0
+
+    thin = Projected(Collision, {"secret"})
+    assert thin.complete is False
+    assert thin.validate_json(b'{"secret":9}').secret == 0
+    with pytest.raises(ValueError, match="by name"):
+        thin.validate_json(b'{"secret":9}', by_name=True)
+    plan = jpp.projection_plan(Collision, {"secret"})
+    assert len(plan.fallbacks) == 1
+    assert plan.fallbacks[0].exclusions == {Collision: frozenset({"secret"})}
+    assert "colliding" in plan.fallbacks[0].reason
+
+
+@pytest.mark.parametrize(
+    "alias",
+    [
+        "\x00excluded:secret",
+        AliasChoices("preferred", "\x00excluded:secret"),
+        AliasPath("\x00excluded:secret", "inner"),
+    ],
+    ids=["alias", "alias-choices", "alias-path"],
+)
+def test_retained_alias_for_an_excluded_default_sentinel_is_refused(alias):
+    class Collision(BaseModel):
+        keep: int = Field(validation_alias=alias)
+        secret: int = 0
+
+    raw = b'{"\\u0000excluded:secret":9}'
+    plan = projection_plan(Collision, {"secret"})
+    assert project(raw, plan.spec) == raw
+    assert plan.complete is False
+    assert len(plan.fallbacks) == 1
+    assert plan.fallbacks[0].exclusions == {Collision: frozenset({"secret"})}
+    assert "colliding" in plan.fallbacks[0].reason
+    with pytest.raises(ValueError, match="retained field 'keep'.*excluded field 'secret'"):
+        Projected(Collision, {"secret"})
+    for assume_projected in (False, True):
+        with pytest.raises(ValueError, match="retained field 'keep'.*excluded field 'secret'"):
+            projected_validator(Collision, {"secret"}, assume_projected=assume_projected)
+
+
+def test_required_exclusions_do_not_use_a_sentinel_alias():
+    class Collision(BaseModel):
+        keep: int = Field(validation_alias="\x00excluded:secret")
+        secret: int
+
+    plan = projection_plan(Collision, {"secret"})
+    assert plan.complete is True and plan.fallbacks == ()
+    out = Projected(Collision, {"secret"}).validate_json(b'{"\\u0000excluded:secret":9}')
+    assert out.keep == 9 and "secret" not in out.__dict__
+
+
+@pytest.mark.parametrize("n", [128, 512])
+def test_wide_defaulted_model_indexes_retained_aliases_once(monkeypatch: pytest.MonkeyPatch, n: int):
+    fields: dict[str, Any] = {f"f{i}": (int, 0) for i in range(n)}
+    wide = create_model("Wide", **fields)  # type: ignore[call-overload]
+    excluded = {f"f{i}" for i in range(n // 2)}
+    calls = 0
+    real = jpp._field_keys
+
+    def counting(name: str, alias: Any) -> list[tuple[str, bool]]:
+        nonlocal calls
+        calls += 1
+        return real(name, alias)
+
+    monkeypatch.setattr(jpp, "_field_keys", counting)
+    validator = projected_validator(wide, excluded)
+    assert n // 2 <= calls <= n, calls
+    out = validator.validate_python({"f0": 9, f"f{n - 1}": 9})
+    assert out.f0 == 0 and getattr(out, f"f{n - 1}") == 9
+
+
+def test_complete_covers_input_keys_not_attributes_assigned_by_after_validators():
+    class AssignsAfter(BaseModel):
+        keep: int
+        secret: int = 0
+
+        @model_validator(mode="after")
+        def recreate(self):
+            self.secret = self.keep
+            return self
+
+    thin = Projected(AssignsAfter, {"secret"})
+    assert thin.complete is True
+    assert thin.spec(b'{"keep":9,"secret":99}') == b'{"keep":9}'
+    assert thin.validate_json(b'{"keep":9,"secret":99}').secret == 9
+
+
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 def test_excluded_class_under_an_opaque_shape_still_gets_its_default(shape):
     Child = _child()
@@ -659,7 +892,7 @@ def test_root_model_fields_are_not_taken_from_the_wrapped_class():
         projected_validator(Root, {"x"})
     with pytest.raises(TypeError):
         projection_spec(Root, set())
-    with pytest.raises(TypeError):
+    with pytest.raises(ValueError, match="Root.x"):
         Projected(Root, {"x"})
 
 
